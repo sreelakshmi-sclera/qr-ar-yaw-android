@@ -185,11 +185,12 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             if (frame == null) {
                 return Unit.INSTANCE;
             }
+            TrackingState state = frame.getCamera().getTrackingState();
+            Log.d("AR_DEBUG", "TrackingState = " + state);
 
-            if (frame.getCamera().getTrackingState() != TrackingState.TRACKING) {
+            if (state != TrackingState.TRACKING) {
                 return Unit.INSTANCE;
             }
-
             processFrame(frame);
             return Unit.INSTANCE;
         });
@@ -294,6 +295,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
 
     private void onQrDetected(String payload, List<float[]> corners) {
+        lastDetectedCorners = corners;
         if (payload.equals(lastPayload)) return;
         lastPayload = payload;
 
@@ -326,6 +328,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
 
     private void processFrame(Frame frame) {
+        scanQrFromArFrame(frame);
         if (!isSampling) {
             return;
         }
@@ -673,5 +676,47 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         super.onPause();
         if (arSession != null) arSession.pause();
         sensorManager.unregisterListener(this);
+    }
+    @OptIn(markerClass = ExperimentalGetImage.class)
+    private void scanQrFromArFrame(Frame frame) {
+        try {
+            android.media.Image image = frame.acquireCameraImage();
+            int rotationDegrees = degreesFromSurfaceRotation(
+                    getWindowManager().getDefaultDisplay().getRotation()
+            );
+
+
+            InputImage inputImage =
+                    InputImage.fromMediaImage(image, rotationDegrees);
+
+            scanner.process(inputImage)
+                    .addOnSuccessListener(barcodes -> {
+                        for (Barcode b : barcodes) {
+                            if (b.getFormat() == Barcode.FORMAT_QR_CODE &&
+                                    b.getRawValue() != null) {
+
+                                String payload = b.getRawValue();
+
+                                runOnUiThread(() ->
+                                        onQrDetected(payload, extractScreenCorners(b)));
+
+                                break;
+                            }
+                        }
+                    })
+                    .addOnCompleteListener(task -> image.close());
+
+        } catch (Exception e) {
+            // ignore if image not available
+        }
+    }
+    private int degreesFromSurfaceRotation(int rotation) {
+        switch (rotation) {
+            case android.view.Surface.ROTATION_0: return 0;
+            case android.view.Surface.ROTATION_90: return 90;
+            case android.view.Surface.ROTATION_180: return 180;
+            case android.view.Surface.ROTATION_270: return 270;
+            default: return 0;
+        }
     }
 }
