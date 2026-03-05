@@ -63,9 +63,12 @@ public class MainActivity extends AppCompatActivity {
     private QROverlayView overlayView;
     private long lastQrSeenTime = 0;
     private static final long QR_LOST_TIMEOUT_MS = 800;
+    private double currentYawNorth = 0.0;
 
     private TextView statusText, infoText, modeText, dbBadge;
     private Button btnRegister, btnValidate, btnHistory;
+
+    public NorthAlignedYawManager northAlignedYawManager;
 
     private final BarcodeScanner scanner =
             BarcodeScanning.getClient(
@@ -281,7 +284,7 @@ public class MainActivity extends AppCompatActivity {
         btnRegister = findViewById(R.id.btn_register);
         btnValidate = findViewById(R.id.btn_validate);
         btnHistory = findViewById(R.id.btn_history);
-
+        northAlignedYawManager = new NorthAlignedYawManager(this);
         btnRegister.setOnClickListener(v -> registerTapped());
         btnValidate.setOnClickListener(v -> validateTapped());
         btnHistory.setOnClickListener(v -> historyTapped());
@@ -596,34 +599,73 @@ public class MainActivity extends AppCompatActivity {
      * Feeds one frame into the buffer; fires commitReading when full.
      * Mirrors iOS collectSample(corners:arFrame:).
      */
+//    private void collectSample(Frame frame, List<float[]> corners) {
+//        QRMeasurement result = computeQRYawFromTopEdge(frame, corners);
+//
+//        if (result == null) return;
+//
+//        // Skip frames where the QR edge has insufficient horizontal content
+//        if (result.confidence < MIN_SAMPLE_WEIGHT) {
+//            log(String.format(Locale.US,
+//                    "Sample rejected (confidence %.2f < %.2f)", result.confidence, MIN_SAMPLE_WEIGHT));
+//            return;
+//        }
+//
+//        sampleBuffer.add(new YawSample(result.yaw, result.confidence));
+//        log(String.format(Locale.US, "  Sample %d: yaw=%.1f° conf=%.2f [%s]",
+//                sampleBuffer.size(), result.yaw, result.confidence, result.method));
+//
+//        final String methodCopy = result.method;
+//        final int countCopy = sampleBuffer.size();
+//        runOnUiThread(() ->
+//                dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES
+//                        + " [" + methodCopy + "]"));
+//
+//        if (sampleBuffer.size() >= REQUIRED_SAMPLES) {
+//            isSampling = false;
+//            double finalYaw = circularWeightedMean(sampleBuffer);
+//            log(String.format(Locale.US,
+//                    "Sampling complete. Averaged yaw = %.2f° from %d samples",
+//                    finalYaw, sampleBuffer.size()));
+//            sampleBuffer.clear();
+//            commitReading(finalYaw);
+//        }
+//    }
+
     private void collectSample(Frame frame, List<float[]> corners) {
-        QRMeasurement result = computeQRYawFromTopEdge(frame, corners);
-        if (result == null) return;
 
-        // Skip frames where the QR edge has insufficient horizontal content
-        if (result.confidence < MIN_SAMPLE_WEIGHT) {
-            log(String.format(Locale.US,
-                    "Sample rejected (confidence %.2f < %.2f)", result.confidence, MIN_SAMPLE_WEIGHT));
-            return;
-        }
+        // 🔥 Use stabilized north-aligned device yaw
+        double yawNorth = currentYawNorth;
 
-        sampleBuffer.add(new YawSample(result.yaw, result.confidence));
-        log(String.format(Locale.US, "  Sample %d: yaw=%.1f° conf=%.2f [%s]",
-                sampleBuffer.size(), result.yaw, result.confidence, result.method));
+//        // Optional: reject unstable compass
+//        if (northAlignedYawManager.isUnstable()) {
+//            log("Sample rejected (compass unstable)");
+//            return;
+//        }
 
-        final String methodCopy = result.method;
+        sampleBuffer.add(new YawSample(yawNorth, 1.0)); // weight = 1.0
+
+        log(String.format(Locale.US,
+                "  Sample %d: yawNorth=%.1f°",
+                sampleBuffer.size(), yawNorth));
+
         final int countCopy = sampleBuffer.size();
         runOnUiThread(() ->
                 dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES
-                        + " [" + methodCopy + "]"));
+                        + " [North aligned]"));
 
         if (sampleBuffer.size() >= REQUIRED_SAMPLES) {
+
             isSampling = false;
+
             double finalYaw = circularWeightedMean(sampleBuffer);
+
             log(String.format(Locale.US,
-                    "Sampling complete. Averaged yaw = %.2f° from %d samples",
+                    "Sampling complete. Averaged north yaw = %.2f° from %d samples",
                     finalYaw, sampleBuffer.size()));
+
             sampleBuffer.clear();
+
             commitReading(finalYaw);
         }
     }
@@ -709,9 +751,9 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            double delta = angleDifference(record.yaw, yaw);
+//            double delta = angleDifference(record.yaw, yaw);
+            double delta = normalizeDelta(yaw - record.yaw);
             boolean within = Math.abs(delta) <= DEFAULT_TOLERANCE;
-
             QRDatabaseHelper.getInstance(this).saveValidation(
                     record.id, lastPayload, yaw, record.yaw, delta, within, DEFAULT_TOLERANCE);
 
@@ -730,7 +772,12 @@ public class MainActivity extends AppCompatActivity {
                     yaw, record.yaw, delta, within));
         }
     }
-
+    private double normalizeDelta(double delta) {
+        delta = (delta + 180) % 360;
+        if (delta < 0)
+            delta += 360;
+        return delta - 180;
+    }
     // ─────────────────────────────────────────────────────────────────────────
     // Core: Compute QR World Yaw via ARCore  (mirrors iOS computeQRYawFromTopEdge)
     //
@@ -1079,7 +1126,10 @@ public class MainActivity extends AppCompatActivity {
 
     private void processARFrame(Frame frame) {
         if (isProcessingFrame) return;
+        if (northAlignedYawManager == null) return;
         isProcessingFrame = true;
+
+        currentYawNorth = northAlignedYawManager.getNorthAlignedYaw(frame);
         scanQrFromArFrame(frame);
     }
 
