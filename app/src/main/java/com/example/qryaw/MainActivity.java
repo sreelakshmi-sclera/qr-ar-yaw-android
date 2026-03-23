@@ -2,6 +2,7 @@ package com.example.qryaw;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.hardware.Sensor;
 import android.hardware.SensorManager;
 import android.os.Bundle;
 import android.util.Log;
@@ -24,14 +25,8 @@ import io.github.sceneview.ar.ARSceneView;
 import kotlin.Unit;
 
 import com.google.ar.core.CameraIntrinsics;
-import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
-import com.google.ar.core.HitResult;
-import com.google.ar.core.Pose;
-import com.google.ar.core.Session;
 import com.google.ar.core.TrackingState;
-import com.google.ar.core.exceptions.CameraNotAvailableException;
-import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException;
 import com.google.mlkit.vision.barcode.BarcodeScanner;
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions;
 import com.google.mlkit.vision.barcode.BarcodeScanning;
@@ -45,7 +40,7 @@ import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final String TAG = "QRYaw";
+    private static final String TAG = "QRYaws";
 
     // ── Sampling config (mirrors iOS constants) ──
     private static final int REQUIRED_SAMPLES = 8;
@@ -59,13 +54,11 @@ public class MainActivity extends AppCompatActivity {
 
     // ── AR / UI ──
     private ARSceneView arSceneView;
-    private Session arSession;
     private QROverlayView overlayView;
-    private long lastQrSeenTime = 0;
-    private static final long QR_LOST_TIMEOUT_MS = 800;
 
     private TextView statusText, infoText, modeText, dbBadge;
-    private Button btnRegister, btnValidate, btnHistory;
+    private Button btnRegister;
+    private Button btnValidate;
 
     private final BarcodeScanner scanner =
             BarcodeScanning.getClient(
@@ -82,10 +75,23 @@ public class MainActivity extends AppCompatActivity {
     private boolean isSampling = false;
     private SamplingPurpose purpose = SamplingPurpose.REGISTER;
     private final List<YawSample> sampleBuffer = new ArrayList<>();
+    private long lastSampleTime = 0;
+    /**
+     * Max gap between consecutive samples — if exceeded, restart sampling
+     * because the QR was lost long enough that the user may have shifted.
+     */
+    private static final long MAX_SAMPLE_GAP_MS = 400;
     /**
      * Last detected screen corners — updated when QR is found, cleared when lost
      */
     private List<float[]> lastDetectedCorners;
+
+    // ── QR-lost debounce ──
+    // ML Kit is async and can miss QR on individual frames (motion blur, focus, etc.)
+    // unlike iOS Vision which runs synchronously and is more frame-consistent.
+    // We debounce the "QR lost" signal: only clear after several consecutive misses.
+    private long lastQrSeenTime = 0;
+    private static final long QR_LOST_TIMEOUT_MS = 500;
 
     private enum SamplingPurpose {REGISTER, VALIDATE}
 
@@ -143,17 +149,6 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * Rotate a camera-space vector into world space using the ARCore camera pose matrix.
-     * <p>
-     * ARCore's getPose().toMatrix() gives a column-major 4×4 matrix where the
-     * rotation columns are:
-     * col 0 = world-space direction of camera +X (right)
-     * col 1 = world-space direction of camera +Y (up)
-     * col 2 = world-space direction of camera +Z (INTO the scene, i.e. forward)
-     * <p>
-     * This is OPPOSITE to ARKit where col 2 = camera BACK (+Z = away from scene).
-     * Standard matrix multiply handles this correctly as long as our camera-space
-     * vectors use the same convention — +Z forward (into scene) — which is what
-     * toCameraRay produces after the Y-flip (no Z-flip needed for ARCore).
      */
     private static float[] rotateCamToWorld(float[] camVec, float[] m) {
         return new float[]{
@@ -183,9 +178,6 @@ public class MainActivity extends AppCompatActivity {
 
     // ── Compass for North alignment (iOS gravityAndHeading equivalent) ──
     private android.hardware.SensorManager sensorManager;
-    private final float[] gravity = new float[3];
-    private final float[] geomagnetic = new float[3];
-    private final float[] rotationMatrix = new float[9];
     private final float[] orientation = new float[3];
 
     private double arNorthOffsetDeg = Double.NaN;
@@ -196,74 +188,69 @@ public class MainActivity extends AppCompatActivity {
 
                 @Override
                 public void onSensorChanged(android.hardware.SensorEvent event) {
+                    if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
 
-                    if (event.sensor.getType() == android.hardware.Sensor.TYPE_ACCELEROMETER) {
-                        System.arraycopy(event.values, 0, gravity, 0, 3);
-                    } else if (event.sensor.getType() == android.hardware.Sensor.TYPE_MAGNETIC_FIELD) {
-                        System.arraycopy(event.values, 0, geomagnetic, 0, 3);
-                    }
+                        float[] rotationMatrix = new float[9];
+                        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
 
-                    if (android.hardware.SensorManager.getRotationMatrix(
-                            rotationMatrix, null, gravity, geomagnetic)) {
+                        float[] remappedRotationMatrix = new float[9];
                         SensorManager.remapCoordinateSystem(
                                 rotationMatrix,
                                 SensorManager.AXIS_X,
                                 SensorManager.AXIS_Z,
-                                rotationMatrix);
-                        android.hardware.SensorManager.getOrientation(rotationMatrix, orientation);
+                                remappedRotationMatrix);
+
+                        SensorManager.getOrientation(remappedRotationMatrix, orientation);
 
                         double azimuthDeg = Math.toDegrees(orientation[0]);
                         if (azimuthDeg < 0) azimuthDeg += 360.0;
 
                         long now = System.currentTimeMillis();
-
                         if (compassStartTime == 0) {
                             compassStartTime = now;
                         }
 
+                        // Keep your old 3-second locking logic!
                         if (!compassReady) {
-                            double rad = Math.toRadians(azimuthDeg);
-                            compassSin += Math.sin(rad);
-                            compassCos += Math.cos(rad);
-                            compassSamples++;
+                            Frame frame = arSceneView.getFrame();
+                            if (frame != null && frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
 
-                            if (now - compassStartTime > 1500 && compassSamples > 5) {
+                                double rad = Math.toRadians(azimuthDeg);
+                                compassSin += Math.sin(rad);
+                                compassCos += Math.cos(rad);
+                                compassSamples++;
 
-                                double meanRad = Math.atan2(compassSin / compassSamples,
-                                        compassCos / compassSamples);
-
-                                double meanDeg = Math.toDegrees(meanRad);
-                                if (meanDeg < 0) meanDeg += 360.0;
-
-                                Frame frame = arSceneView.getFrame();
-
-                                if (frame != null &&
-                                        frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
+                                if (now - compassStartTime > 3000 && compassSamples > 15) {
+                                    double meanRad = Math.atan2(compassSin / compassSamples, compassCos / compassSamples);
+                                    double meanDeg = Math.toDegrees(meanRad);
+                                    if (meanDeg < 0) meanDeg += 360.0;
 
                                     double arYaw = getARCameraYawDegrees(frame);
-
                                     arNorthOffsetDeg = meanDeg - arYaw;
-
-                                    // normalize
                                     while (arNorthOffsetDeg < 0) arNorthOffsetDeg += 360;
                                     while (arNorthOffsetDeg >= 360) arNorthOffsetDeg -= 360;
 
                                     compassReady = true;
+                                    log("Compass locked at " + meanDeg + "° using ROTATION_VECTOR");
 
-                                    log("Compass locked at " + meanDeg + "°");
-                                    log("AR yaw at lock " + arYaw + "°");
-                                    log("North offset " + arNorthOffsetDeg + "°");
+                                    runOnUiThread(() -> {
+                                        dbBadge.setText("✅ Compass ready — North-anchored");
+                                        if (currentRegistration != null) {
+                                            setMode(ScanMode.VALIDATE);
+                                        } else if (lastPayload != null) {
+                                            setMode(ScanMode.REGISTER);
+                                        } else {
+                                            showStatus("Scan a QR code to begin");
+                                        }
+                                    });
                                 }
-
-                                log("Compass locked (stable) at " + arNorthOffsetDeg + "°");
                             }
                         }
                     }
                 }
 
                 @Override
-                public void onAccuracyChanged(android.hardware.Sensor sensor, int accuracy) {
-                }
+                public void onAccuracyChanged(android.hardware.Sensor sensor, int accuracy) {}
             };
 
     @Override
@@ -280,7 +267,7 @@ public class MainActivity extends AppCompatActivity {
         dbBadge = findViewById(R.id.db_badge);
         btnRegister = findViewById(R.id.btn_register);
         btnValidate = findViewById(R.id.btn_validate);
-        btnHistory = findViewById(R.id.btn_history);
+        Button btnHistory = findViewById(R.id.btn_history);
 
         btnRegister.setOnClickListener(v -> registerTapped());
         btnValidate.setOnClickListener(v -> validateTapped());
@@ -300,29 +287,16 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         resetCompass();
-        if (arSession != null) {
-            try {
-                arSession.resume();
-            } catch (CameraNotAvailableException e) {
-                Toast.makeText(this, "Camera unavailable", Toast.LENGTH_LONG).show();
-            }
-        }
 
         sensorManager.registerListener(
                 compassListener,
-                sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_ACCELEROMETER),
-                android.hardware.SensorManager.SENSOR_DELAY_UI);
-
-        sensorManager.registerListener(
-                compassListener,
-                sensorManager.getDefaultSensor(android.hardware.Sensor.TYPE_MAGNETIC_FIELD),
+                sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR),
                 android.hardware.SensorManager.SENSOR_DELAY_UI);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        if (arSession != null) arSession.pause();
         sensorManager.unregisterListener(compassListener);
     }
 
@@ -338,7 +312,7 @@ public class MainActivity extends AppCompatActivity {
             }
             if (availability.isSupported()) {
                 initializeArSession();
-                startArSession();         // mirrors startARSession()
+                startArSession();
             } else {
                 statusText.setText("ARCore not supported on this device.");
             }
@@ -356,35 +330,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void initializeArSession() {
         try {
-            arSession = new Session(this);
-            Config config = new Config(arSession);
-            config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
-            // NOTE: ARCore has no setWorldAlignment() API (unlike ARKit's .gravityAndHeading).
-            // World-space yaw from ARCore is relative to an arbitrary heading at session start.
-            // We compensate in applyNorthOffset() using the device magnetometer, producing
-            // absolute compass bearings that match what iOS stores with .gravityAndHeading.
-            config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
-            if (arSession.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                config.setDepthMode(Config.DepthMode.AUTOMATIC);
-            }
-            arSession.configure(config);
-            arSceneView.getPlaneRenderer().setEnabled(true);
-        } catch (UnavailableArcoreNotInstalledException e) {
-            statusText.setText("Please install ARCore");
+            arSceneView.getPlaneRenderer().setEnabled(false);
         } catch (Exception e) {
-            Log.e(TAG, "AR session failed", e);
+            Log.e(TAG, "AR setup failed", e);
             statusText.setText("AR init failed");
         }
     }
 
-    /**
-     * Mirrors iOS startARSession():
-     * - Disables Register/Validate buttons for 2 s while compass stabilises.
-     * - Shows a "Compass stabilizing…" message then re-enables appropriately.
-     */
     private void startArSession() {
         resetCompass();
-        // Disable buttons immediately
         btnRegister.setEnabled(false);
         btnRegister.setAlpha(0.5f);
         btnValidate.setEnabled(false);
@@ -398,16 +352,15 @@ public class MainActivity extends AppCompatActivity {
             if (frame == null) return Unit.INSTANCE;
             if (frame.getCamera().getTrackingState() != TrackingState.TRACKING)
                 return Unit.INSTANCE;
+
             processARFrame(frame);
             return Unit.INSTANCE;
         });
 
-        // Re-enable after 2 s, exactly as iOS does
         arSceneView.postDelayed(() -> {
             dbBadge.setText("✅ Compass ready — North-anchored");
             showStatus("Scan a QR code to begin");
 
-            // Re-enable based on current state (mirror of iOS logic)
             if (lastDetectedCorners != null) {
                 btnRegister.setEnabled(true);
                 btnRegister.setAlpha(1f);
@@ -421,20 +374,17 @@ public class MainActivity extends AppCompatActivity {
 
     // ─────────────────────────────────────────────────────────────────────────
     // QR Payload Detected → Auto-load from DB
-    // Mirrors iOS onQRPayloadDetected(_:)
     // ─────────────────────────────────────────────────────────────────────────
 
     private void onQRPayloadDetected(String payload) {
-        // Guard: ignore duplicate payloads (same as iOS)
         if (payload.equals(lastPayload)) return;
         lastPayload = payload;
-        currentRegistration = null;   // reset just like iOS sets registration = nil
+        currentRegistration = null;
 
         QRDatabaseHelper.Registration record =
                 QRDatabaseHelper.getInstance(this).fetchRegistration(payload);
 
         if (record != null) {
-            // ── FOUND IN DB ──
             currentRegistration = record;
 
             setMode(ScanMode.VALIDATE);
@@ -444,7 +394,6 @@ public class MainActivity extends AppCompatActivity {
 
             log("DB hit → payload=" + payload + " yaw=" + record.yaw + "°");
         } else {
-            // ── NOT IN DB ──
             setMode(ScanMode.REGISTER);
             dbBadge.setText("🆕 New QR — not yet registered");
             showStatus("QR Detected ✓\nNo prior registration found.\nPress REGISTER to save yaw.");
@@ -453,13 +402,31 @@ public class MainActivity extends AppCompatActivity {
 
             log("DB miss → payload=" + payload);
         }
+
+        // Only enable buttons if compass is actually ready
+        if (compassReady) {
+            btnRegister.setEnabled(true);
+            btnRegister.setAlpha(1f);
+            if (currentRegistration != null) {
+                btnValidate.setEnabled(true);
+                btnValidate.setAlpha(1f);
+            }
+        } else {
+            btnRegister.setEnabled(false);
+            btnValidate.setEnabled(false);
+            showStatus("⏳ Waiting for Compass lock...");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Button Actions  (mirrors iOS @objc registerTapped / validateTapped / historyTapped)
+    // Button Actions
     // ─────────────────────────────────────────────────────────────────────────
 
     private void registerTapped() {
+        if (!compassReady) {
+            showStatus("⏳ Compass still aligning. Please wait...");
+            return;
+        }
         if (lastDetectedCorners == null) {
             showStatus("⚠️ No QR code in frame. Point camera at QR code.");
             return;
@@ -468,11 +435,15 @@ public class MainActivity extends AppCompatActivity {
             showStatus("⚠️ QR payload not decoded yet.");
             return;
         }
-        if (isSampling) return;   // already collecting
+        if (isSampling) return;
         startSampling(SamplingPurpose.REGISTER);
     }
 
     private void validateTapped() {
+        if (!compassReady) {
+            showStatus("⏳ Compass still aligning. Please wait...");
+            return;
+        }
         if (lastDetectedCorners == null) {
             showStatus("⚠️ No QR code in frame.");
             return;
@@ -513,10 +484,11 @@ public class MainActivity extends AppCompatActivity {
         }
         if (reg != null) {
             msg.append(String.format(Locale.US, "Yaw      : %.1f°\n", reg.yaw));
-            msg.append(String.format(Locale.US, "Normal   : (%.3f, %.3f, %.3f)\n", reg.normalX, reg.normalY, reg.normalZ));
             msg.append(String.format(Locale.US, "Tolerance: ±%.0f°\n", reg.tolerance));
             msg.append("Saved    : ").append(relativeTime(reg.registeredAt)).append("\n");
             msg.append("Device   : ").append(android.os.Build.MODEL).append("\n");
+            // FIX #1: Mirror iOS which shows appVersion in history
+            msg.append("App      : ").append(getAppVersion()).append("\n");
         } else {
             msg.append("None found.\n");
         }
@@ -544,7 +516,6 @@ public class MainActivity extends AppCompatActivity {
                     dbBadge.setText("");
                     infoText.setText("");
                     showStatus("Registration deleted.\nScan a QR code to begin.");
-                    // Reset buttons (mirror iOS)
                     btnRegister.setEnabled(false);
                     btnRegister.setAlpha(0.5f);
                     btnValidate.setEnabled(false);
@@ -560,51 +531,79 @@ public class MainActivity extends AppCompatActivity {
     private enum ScanMode {REGISTER, VALIDATE}
 
     private void setMode(ScanMode mode) {
+        boolean canClick = compassReady && !isSampling;
+
         switch (mode) {
             case REGISTER:
                 modeText.setText("MODE: REGISTER");
-                btnRegister.setEnabled(true);
-                btnRegister.setAlpha(1f);
+                modeText.setTextColor(0xFFFFEB3B);
+                btnRegister.setEnabled(canClick);
+                btnRegister.setAlpha(canClick ? 1f : 0.5f);
                 btnValidate.setEnabled(false);
                 btnValidate.setAlpha(0.5f);
                 break;
             case VALIDATE:
                 modeText.setText("MODE: VALIDATE");
-                btnRegister.setEnabled(true);    // allow re-registration
-                btnRegister.setAlpha(0.8f);
-                btnValidate.setEnabled(true);
-                btnValidate.setAlpha(1f);
+                modeText.setTextColor(0xFF4CAF50);
+                btnRegister.setEnabled(canClick);
+                btnRegister.setAlpha(canClick ? 0.8f : 0.5f);
+                btnValidate.setEnabled(canClick);
+                btnValidate.setAlpha(canClick ? 1f : 0.5f);
                 break;
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Sampling Engine  (mirrors iOS startSampling / collectSample / circularWeightedMean)
+    // Sampling Engine
     // ─────────────────────────────────────────────────────────────────────────
 
     private void startSampling(SamplingPurpose p) {
         sampleBuffer.clear();
         purpose = p;
         isSampling = true;
+        lastSampleTime = 0;   // reset — first sample has no gap check
         String action = (p == SamplingPurpose.REGISTER) ? "Registering" : "Validating";
         showStatus("📐 " + action + "... hold still\n(collecting " + REQUIRED_SAMPLES + " samples)");
         dbBadge.setText("🔄 Sampling 0/" + REQUIRED_SAMPLES + "...");
     }
 
-    /**
-     * Called from processARFrame while isSampling == true.
-     * Feeds one frame into the buffer; fires commitReading when full.
-     * Mirrors iOS collectSample(corners:arFrame:).
-     */
-    private void collectSample(Frame frame, List<float[]> corners) {
-        QRMeasurement result = computeQRYawFromTopEdge(frame, corners);
+    private void collectSample(Frame frame, float[] imagePoints) {
+        QRMeasurement result = computeQRYawFromTopEdge(frame, imagePoints);
         if (result == null) return;
 
-        // Skip frames where the QR edge has insufficient horizontal content
         if (result.confidence < MIN_SAMPLE_WEIGHT) {
             log(String.format(Locale.US,
                     "Sample rejected (confidence %.2f < %.2f)", result.confidence, MIN_SAMPLE_WEIGHT));
             return;
+        }
+
+        log("method=" + result.method);
+
+        // ── Staleness check ──
+        // If there was a big gap since the last accepted sample, the QR was
+        // intermittently lost and the user may have shifted position. Discard
+        // all prior samples and restart the buffer from this sample.
+        long now = System.currentTimeMillis();
+        if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
+            int discarded = sampleBuffer.size();
+            sampleBuffer.clear();
+            log(String.format(Locale.US,
+                    "Sample gap %dms > %dms — discarded %d stale samples, restarting",
+                    (now - lastSampleTime), MAX_SAMPLE_GAP_MS, discarded));
+            runOnUiThread(() ->
+                    dbBadge.setText("🔄 Gap detected — resampling 0/" + REQUIRED_SAMPLES));
+        }
+        lastSampleTime = now;
+
+        if (!sampleBuffer.isEmpty()) {
+
+            double referenceYaw = circularWeightedMean(sampleBuffer);
+            double diff = Math.abs(angleDifference(referenceYaw, result.yaw));
+
+            if (diff > 45) {
+                log("Rejected sample due to yaw jump: " + result.yaw);
+                return;
+            }
         }
 
         sampleBuffer.add(new YawSample(result.yaw, result.confidence));
@@ -628,10 +627,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Weighted circular mean — handles 0°/360° wraparound correctly.
-     * Mirrors iOS circularWeightedMean(samples:).
-     */
     private double circularWeightedMean(List<YawSample> samples) {
         double sumSin = 0, sumCos = 0, totalWeight = 0;
         for (YawSample s : samples) {
@@ -648,19 +643,22 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * Called once sampling is complete with the final averaged yaw.
-     * Mirrors iOS commitReading(yaw:arFrame:).
      * <p>
-     * NOTE ON COORDINATE FRAME:
-     * ARCore's world coordinate system has Y=up (gravity-aligned) but an
-     * arbitrary heading.  That is fine — both REGISTER and VALIDATE happen
-     * inside the SAME ARCore session, so the yaw values are self-consistent.
-     * The QR face normal comparison (delta) is valid even without North-anchoring.
-     * We do NOT apply any compass offset here; doing so was the primary cause
-     * of false "MOVED" results because the device heading changes between the
-     * register tap and the validate tap.
+     * FIX #3: Now applies North offset so yaw values are absolute compass bearings,
+     * matching iOS .gravityAndHeading behavior. Without this, registrations from
+     * one ARCore session could not be validated in another session because ARCore
+     * uses an arbitrary heading each time.
      */
-    private void commitReading(double yaw) {
+    private void commitReading(double rawYaw) {
         if (lastPayload == null) return;
+
+        double yaw = rawYaw;
+
+        // APPLY THE COMPASS OFFSET HERE
+        if (!Double.isNaN(arNorthOffsetDeg)) {
+            yaw = (rawYaw + arNorthOffsetDeg) % 360.0;
+            if (yaw < 0) yaw += 360.0;
+        }
 
         // Synthetic normal for DB compatibility (mirrors iOS)
         double yawRad = Math.toRadians(yaw);
@@ -677,7 +675,6 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            // Build in-memory registration (mirrors iOS QRYawRegistration)
             QRDatabaseHelper.Registration reg = new QRDatabaseHelper.Registration();
             reg.id = dbId;
             reg.payload = lastPayload;
@@ -689,22 +686,25 @@ public class MainActivity extends AppCompatActivity {
             reg.registeredAt = new Date();
             currentRegistration = reg;
 
+            double finalYaw = yaw;
             runOnUiThread(() -> {
                 setMode(ScanMode.VALIDATE);
                 dbBadge.setText("💾 Saved to DB  (id=" + dbId + ")");
                 showStatus(String.format(Locale.US,
-                        "✅ Registered & Saved!\nYaw = %.1f°  |  id=%d", yaw, dbId));
-                updateInfoLabel(yaw, reg, null, InfoSource.FRESH_REGISTER);
+                        "✅ Registered & Saved!\nYaw = %.1f°  |  id=%d", finalYaw, dbId));
+                updateInfoLabel(finalYaw, reg, null, InfoSource.FRESH_REGISTER);
             });
 
-            log(String.format(Locale.US, "Registered → yaw=%.1f° dbId=%d", yaw, dbId));
+            log(String.format(Locale.US,
+                    "Registered → payload=%s…  yaw=%.1f°  dbId=%d",
+                    lastPayload.substring(0, Math.min(20, lastPayload.length())), yaw, dbId));
 
         } else {
             // ── VALIDATE AGAINST DB ──
             QRDatabaseHelper.Registration record =
                     QRDatabaseHelper.getInstance(this).fetchRegistration(lastPayload);
             if (record == null) {
-                showStatus("⚠️ No registration found. Press REGISTER first.");
+                showStatus("⚠️ No previous registration found.\nPress REGISTER first.");
                 setMode(ScanMode.REGISTER);
                 return;
             }
@@ -715,6 +715,7 @@ public class MainActivity extends AppCompatActivity {
             QRDatabaseHelper.getInstance(this).saveValidation(
                     record.id, lastPayload, yaw, record.yaw, delta, within, DEFAULT_TOLERANCE);
 
+            double finalYaw1 = yaw;
             runOnUiThread(() -> {
                 String icon = within ? "✅" : "❌";
                 String moved = within ? "NOT moved" : "MOVED";
@@ -722,236 +723,181 @@ public class MainActivity extends AppCompatActivity {
                         "%s QR has %s\nΔYaw = %+.1f°   (±%.0f° tolerance)",
                         icon, moved, delta, DEFAULT_TOLERANCE));
                 dbBadge.setText("📝 Validation logged to DB");
-                updateInfoLabel(yaw, record, delta, InfoSource.DATABASE);
+                updateInfoLabel(finalYaw1, record, delta, InfoSource.DATABASE);
             });
 
             log(String.format(Locale.US,
-                    "Validate → current=%.1f° registered=%.1f° delta=%.1f° within=%b",
+                    "Validate → payload=%s…\n           current=%.1f°\n           registered=%.1f°\n           Δ=%+.1f°\n           yawOK=%b",
+                    lastPayload.substring(0, Math.min(20, lastPayload.length())),
                     yaw, record.yaw, delta, within));
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Core: Compute QR World Yaw via ARCore  (mirrors iOS computeQRYawFromTopEdge)
-    //
-    // ROOT CAUSE OF ALL PREVIOUS FAILURES:
-    // Both the normal-vector method and the ray-subtraction method work with
-    // angular rays from the camera origin — NOT with actual 3D world positions.
-    // When you scan from the side, the rays diverge at different angles and
-    // the geometry is completely wrong. There is no mathematical fix for this
-    // using rays alone — you need real 3D points.
-    //
-    // THE CORRECT APPROACH:
-    // Use ARCore's hitTest to hit each QR corner against detected world
-    // geometry (planes). This gives actual 3D world coordinates for each corner,
-    // independent of camera angle.
-    //
-    // FALLBACK (when hitTest misses):
-    // Vanishing Point (Homography) solve — mathematically robust way to find
-    // the normal from 2D projection without needing depth.
-    //
-    // CONFIDENCE:
-    // 1.0 = plane-detected, 0.7 = depth-estimate, 0.4 = vanishing-point.
-    // Also weighted by how vertical the QR is (nxzLen).
     // ─────────────────────────────────────────────────────────────────────────
 
-    private QRMeasurement computeQRYawFromTopEdge(Frame frame, List<float[]> corners) {
-        if (corners == null || corners.size() != 4) return null;
+    private QRMeasurement computeQRYawFromTopEdge(Frame frame, float[] imagePoints) {
+        com.google.ar.core.Camera camera = frame.getCamera();
+        if (camera.getTrackingState() != TrackingState.TRACKING) return null;
 
-        // ML Kit corners: [TL=0, TR=1, BR=2, BL=3]
-        float[] tl = corners.get(0);
-        float[] tr = corners.get(1);
-        float[] br = corners.get(2);
-        float[] bl = corners.get(3);
+        CameraIntrinsics intr = camera.getImageIntrinsics();
+        float[] focal = intr.getFocalLength();
+        float[] pp = intr.getPrincipalPoint();
 
-        com.google.ar.core.Camera arCamera = frame.getCamera();
-        if (arCamera.getTrackingState() != TrackingState.TRACKING) return null;
+        float fx = focal[0];
+        float fy = focal[1];
+        float cx = pp[0];
+        float cy = pp[1];
 
-        float viewW = arSceneView.getWidth();
-        float viewH = arSceneView.getHeight();
-        if (viewW <= 0 || viewH <= 0) return null;
+        float[] camPose = new float[16];
+        camera.getPose().toMatrix(camPose, 0);
 
-        CameraIntrinsics intrinsics = arCamera.getImageIntrinsics();
-        float[] focalLength = intrinsics.getFocalLength();    // [fx, fy]
-        float[] principalPt = intrinsics.getPrincipalPoint(); // [cx, cy]
-        int[] imageSize = intrinsics.getImageDimensions();// [w, h]
+        float[] camOrigin = {
+                camPose[12],
+                camPose[13],
+                camPose[14]
+        };
 
-        float[] camTransform = new float[16];
-        arCamera.getPose().toMatrix(camTransform, 0);
+        float[][] imgPts = {
+                {imagePoints[0], imagePoints[1]}, // TL
+                {imagePoints[2], imagePoints[3]}, // TR
+                {imagePoints[4], imagePoints[5]}, // BR
+                {imagePoints[6], imagePoints[7]}  // BL
+        };
 
-        // Center of QR in screen pixel coords
-        float centerScreenX = (tl[0] + tr[0] + br[0] + bl[0]) / 4f;
-        float centerScreenY = (tl[1] + tr[1] + br[1] + bl[1]) / 4f;
-
-        float[] faceNormal = null;
-        String method = "vanishing-point";
-
-        // ════════════════════════════════════════════════════════════
-        // Priority 1: ARCore Plane Detection  (≡ iOS .existingPlaneInfinite)
-        // frame.hitTest takes pixel coords in the display viewport.
-        // The hit pose's Y axis is the plane normal (ARCore convention for planes).
-        // ════════════════════════════════════════════════════════════
-        try {
-            List<HitResult> hits = frame.hitTest(centerScreenX, centerScreenY);
-            if (!hits.isEmpty()) {
-                Pose hitPose = hits.get(0).getHitPose();
-                // ARCore plane normal = Y axis of the hit pose
-                float[] yAxis = hitPose.getYAxis();
-                faceNormal = vec3Normalize(new float[]{yAxis[0], yAxis[1], yAxis[2]});
-                method = "plane-detected";
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "hitTest failed: " + e.getMessage());
+        // ── Build world rays ──
+        float[][] rays = new float[4][];
+        for (int i = 0; i < 4; i++) {
+            float xn = (imgPts[i][0] - cx) / fx;
+            float yn = (imgPts[i][1] - cy) / fy;
+            float[] camRay = vec3Normalize(new float[]{xn, -yn, -1f});
+            rays[i] = vec3Normalize(rotateCamToWorld(camRay, camPose));
         }
 
-        // ════════════════════════════════════════════════════════════
-        // Priority 2: Scene Depth (ARCore Depth API)  (≡ iOS sceneDepth)
-        // Sample depth at QR centre; use camera-forward as initial normal.
-        // ════════════════════════════════════════════════════════════
-        if (faceNormal == null) {
-            try {
-                android.media.Image depthImage = frame.acquireRawDepthImage16Bits();
-                int dw = depthImage.getWidth();
-                int dh = depthImage.getHeight();
+        float[] planeNormal = null;
+        float[] planePoint = null;
+        String method = "angle-solve";
 
-                // Convert screen centre to depth-buffer coords with rotation handling
-                // (mirrors iOS viewToImagePoint)
-                float[] centerImg = viewToImagePoint(centerScreenX, centerScreenY,
-                        viewW, viewH, dw, dh);
-                int dx = Math.min(Math.max((int) centerImg[0], 0), dw - 1);
-                int dy = Math.min(Math.max((int) centerImg[1], 0), dh - 1);
+        if (planeNormal == null) {
+            planeNormal = computeNormalViaVanishingPoint(
+                    imgPts[0], imgPts[1], imgPts[2], imgPts[3],
+                    focal, pp, camPose);
 
-                android.media.Image.Plane depthPlane = depthImage.getPlanes()[0];
-                java.nio.ShortBuffer buffer = depthPlane.getBuffer().asShortBuffer();
-                int rowStride = depthPlane.getRowStride() / 2; // in shorts
-                int offset = dy * rowStride + dx;
-
-                if (offset >= 0 && offset < buffer.capacity()) {
-                    float depthM = (buffer.get(offset) & 0xFFFF) / 1000.0f; // mm → m
-                    if (depthM > 0.05f && depthM < 10.0f) {
-                        // ARCore camera forward = +Z column of pose matrix
-                        float[] camFwd = vec3Normalize(new float[]{
-                                camTransform[8], camTransform[9], camTransform[10]
-                        });
-                        faceNormal = camFwd;
-                        method = "lidar-depth";
-                    }
-                }
-                depthImage.close();
-            } catch (Exception e) {
-                Log.d(TAG, "Depth acquisition failed: " + e.getMessage());
+            if (planeNormal != null) {
+                float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
+                planePoint = new float[]{
+                        camOrigin[0] + camFwd[0],
+                        camOrigin[1] + camFwd[1],
+                        camOrigin[2] + camFwd[2]
+                };
+                method = "vanishing-point";
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // Priority 3: Vanishing Point (Homography) Solve
-        // Mirrors iOS Priority 3 block exactly.
-        // ════════════════════════════════════════════════════════════
-        if (faceNormal == null) {
-            faceNormal = computeNormalViaVanishingPoint(
-                    tl, tr, br, bl, viewW, viewH,
-                    focalLength, principalPt, imageSize, camTransform);
-            if (faceNormal != null) method = "vanishing-point";
+        if (planeNormal == null || planePoint == null) return null;
+
+        // ── Ensure normal faces camera (Points OUT of the wall) ──
+        float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
+        if (vec3Dot(planeNormal, camFwd) > 0) {
+            planeNormal = vec3Scale(planeNormal, -1f);
         }
 
-        if (faceNormal == null) {
-            log("Could not determine QR plane normal");
-            return null;
-        }
+        // ── Ray-plane intersection ──
+        float[] tl3D = intersectPlane(camOrigin, rays[0], planePoint, planeNormal);
+        float[] bl3D = intersectPlane(camOrigin, rays[3], planePoint, planeNormal);
 
-        // ── Ensure normal faces camera ──
-        // ARCore camera forward (into scene) = +Z = column 2 of the pose matrix.
-        // (ARKit uses -Z column 2, which is why iOS negates it. ARCore does not.)
-        float[] camFwd = vec3Normalize(new float[]{
-                camTransform[8], camTransform[9], camTransform[10]
-        });
-        if (vec3Dot(faceNormal, camFwd) < 0) {
-            faceNormal = vec3Scale(faceNormal, -1f);
-        }
+        if (tl3D == null || bl3D == null) return null;
 
-        // ── Extract yaw: project face normal onto horizontal XZ plane ──
-        // yaw = atan2(nx, nz) — clockwise from North (Z axis)
-        double nx = faceNormal[0];
-        double nz = faceNormal[2];
+        // ── Extract yaw ──
+        float nx = planeNormal[0];
+        float nz = planeNormal[2];
         double nxzLen = Math.hypot(nx, nz);
 
-        if (nxzLen < 0.15) {
-            log("QR is nearly horizontal — yaw undefined");
-            return null;
+        double hx, hz;
+
+        if (nxzLen > 0.15) {
+            hx = nx;
+            hz = nz;
+        } else {
+            float[] qrUp = {
+                    tl3D[0] - bl3D[0],
+                    tl3D[1] - bl3D[1],
+                    tl3D[2] - bl3D[2]
+            };
+            qrUp = vec3Normalize(qrUp);
+            hx = qrUp[0];
+            hz = qrUp[2];
+            if (Math.hypot(hx, hz) < 0.15) return null;
         }
 
-        double nxzNormX = nx / nxzLen;
-        double nxzNormZ = nz / nxzLen;
+        double yaw = Math.toDegrees(Math.atan2(hx, hz));
+        if (yaw < 0) yaw += 360;
 
-        double yaw = Math.toDegrees(Math.atan2(nxzNormX, nxzNormZ));
-        if (yaw < 0) yaw += 360.0;
-
-        if (compassReady && !Double.isNaN(arNorthOffsetDeg)) {
-            yaw = (yaw + arNorthOffsetDeg) % 360.0;
-            if (yaw < 0) yaw += 360.0;
-        }
-
-        // Confidence mirrors iOS: baseConf × nxzLen
-        double baseConf = method.equals("plane-detected") ? 1.0
-                : method.equals("lidar-depth") ? 0.7
-                : 0.4;
-        double confidence = baseConf * nxzLen;
+        double baseConf = method.equals("plane-detected") ? 1.0 :
+                method.equals("lidar-depth") ? 0.7 : 0.4;
+        double vertConf = nxzLen > 0.15 ? nxzLen : 1.0;
+        double confidence = baseConf * vertConf;
 
         return new QRMeasurement(yaw, confidence, method);
     }
 
+    private float[] intersectPlane(
+            float[] camOrigin, float[] rayDir,
+            float[] planePoint, float[] planeNormal) {
+
+        float denom = vec3Dot(rayDir, planeNormal);
+        if (Math.abs(denom) < 1e-5) return null;
+
+        float[] diff = {
+                planePoint[0] - camOrigin[0],
+                planePoint[1] - camOrigin[1],
+                planePoint[2] - camOrigin[2]
+        };
+
+        float t = vec3Dot(diff, planeNormal) / denom;
+        if (t <= 0) return null;
+
+        return new float[]{
+                camOrigin[0] + rayDir[0] * t,
+                camOrigin[1] + rayDir[1] * t,
+                camOrigin[2] + rayDir[2] * t
+        };
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Vanishing Point Normal Solve  (mirrors iOS Priority 3 block)
+    // Vanishing Point Normal Solve
     // ─────────────────────────────────────────────────────────────────────────
 
     private float[] computeNormalViaVanishingPoint(
-            float[] tl, float[] tr, float[] br, float[] bl,
-            float viewW, float viewH,
-            float[] focalLength, float[] principalPt, int[] imageSize,
+            float[] imgTL, float[] imgTR, float[] imgBR, float[] imgBL,
+            float[] focalLength, float[] principalPt,
             float[] camTransform) {
         try {
             float fx = focalLength[0];
             float fy = focalLength[1];
             float cx = principalPt[0];
             float cy = principalPt[1];
-            int imgW = imageSize[0];
-            int imgH = imageSize[1];
 
-            // The corners are in view (screen) pixel space.
-            // The intrinsics cx/cy/fx/fy are in SENSOR image pixel space.
-            // We must map view coords → sensor image coords so the spaces match.
-            // viewToImagePoint handles the orientation rotation (portrait ↔ landscape).
-            float[] imgTL = viewToImagePoint(tl[0], tl[1], viewW, viewH, imgW, imgH);
-            float[] imgTR = viewToImagePoint(tr[0], tr[1], viewW, viewH, imgW, imgH);
-            float[] imgBR = viewToImagePoint(br[0], br[1], viewW, viewH, imgW, imgH);
-            float[] imgBL = viewToImagePoint(bl[0], bl[1], viewW, viewH, imgW, imgH);
-
-            // Homogeneous image coordinates (x, y, 1)
+// Use the perfectly mapped coordinates directly
             float[] hTL = {imgTL[0], imgTL[1], 1f};
             float[] hTR = {imgTR[0], imgTR[1], 1f};
             float[] hBR = {imgBR[0], imgBR[1], 1f};
             float[] hBL = {imgBL[0], imgBL[1], 1f};
 
-            // Lines through each pair of collinear corners (projective cross product)
-            float[] lineTop = crossHomogeneous(hTL, hTR);
-            float[] lineBottom = crossHomogeneous(hBL, hBR);
-            float[] lineLeft = crossHomogeneous(hTL, hBL);
-            float[] lineRight = crossHomogeneous(hTR, hBR);
+            float[] lineTop = vec3Cross(hTL, hTR);
+            float[] lineBottom = vec3Cross(hBL, hBR);
+            float[] lineLeft = vec3Cross(hTL, hBL);
+            float[] lineRight = vec3Cross(hTR, hBR);
 
-            // Vanishing points = intersection of the two pairs of parallel edges
-            float[] vpX = crossHomogeneous(lineTop, lineBottom); // horizontal VP
-            float[] vpY = crossHomogeneous(lineLeft, lineRight);  // vertical VP
+            float[] vpX = vec3Cross(lineTop, lineBottom);
+            float[] vpY = vec3Cross(lineLeft, lineRight);
 
-            // Reject degenerate cases (VP at infinity = square-on view, use depth/plane instead)
             if (Math.abs(vpX[2]) < 1e-6f || Math.abs(vpY[2]) < 1e-6f) {
                 Log.d(TAG, "Vanishing points at infinity — QR is square-on, skipping VP solve");
                 return null;
             }
 
-            // Back-project each VP through K^-1 to get a direction ray in camera space.
-            // K^-1 * [u, v, 1]^T = [(u-cx)/fx,  (v-cy)/fy,  1]
-            // Then flip Y and Z to convert from image convention (+Y down, +Z fwd)
-            // to ARCore camera convention (+Y up, +Z back).
             float[] rayX = toCameraRay(vpX, fx, fy, cx, cy);
             float[] rayY = toCameraRay(vpY, fx, fy, cx, cy);
 
@@ -960,15 +906,10 @@ public class MainActivity extends AppCompatActivity {
                 return null;
             }
 
-            // Face normal in camera space = cross product of the two edge directions
             float[] normalCam = vec3Normalize(vec3Cross(rayX, rayY));
 
-            // In ARCore camera space +Z is INTO the scene (forward).
-            // A normal pointing TOWARD the camera has POSITIVE Z.
-            // Ensure it points toward the camera (positive Z).
             if (normalCam[2] < 0) normalCam = vec3Scale(normalCam, -1f);
 
-            // Rotate into world space using camera pose rotation matrix
             float[] normalWorld = rotateCamToWorld(normalCam, camTransform);
 
             Log.d(TAG, String.format(Locale.US,
@@ -984,84 +925,16 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Cross product of two points/lines in homogeneous coordinates
-     */
-    private float[] crossHomogeneous(float[] a, float[] b) {
-        return vec3Cross(a, b);   // identical operation — reuse helper
-    }
-
-    /**
-     * Convert a homogeneous image point to a camera-space direction ray.
-     * <p>
-     * Image/intrinsics convention:  +X right,  +Y DOWN,  +Z forward (into scene)
-     * ARCore camera convention:     +X right,  +Y UP,    +Z forward (into scene)
-     * <p>
-     * So we only need to flip Y.  We do NOT flip Z — ARCore's camera +Z already
-     * points into the scene, matching image convention.
-     * (ARKit is different: its camera +Z points BACK, so iOS flips both Y and Z.)
-     */
     private static float[] toCameraRay(float[] v, float fx, float fy, float cx, float cy) {
         float w = v[2];
         float x = (v[0] - w * cx) / fx;
         float y = (v[1] - w * cy) / fy;
-        // Image +Y is down, ARCore camera +Y is up → flip Y only
-        return vec3Normalize(new float[]{x, -y, w});
+        return vec3Normalize(new float[]{x, -y, -w});
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Coordinate Conversion  (mirrors iOS viewToImagePoint)
-    // Maps a screen-space point to image-buffer pixel coordinates,
-    // accounting for device orientation.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Convert a view (screen) pixel coordinate to sensor image pixel coordinates,
-     * so that the result can be used with ARCore's CameraIntrinsics (which are
-     * always in the sensor's native/landscape coordinate space).
-     * <p>
-     * For a typical rear camera (sensor natural orientation = landscape, mounted
-     * so SENSOR_ORIENTATION = 90°):
-     * <p>
-     * ROTATION_0  (portrait, home-button down):
-     * screen-right  (+X) = sensor-down   (+Y)  → px = (1-ny)*imgW, py = nx*imgH
-     * ROTATION_90  (landscape, home-button right):
-     * screen = sensor exactly             → px = nx*imgW, py = ny*imgH
-     * ROTATION_180 (portrait upside-down):
-     * → px = ny*imgW, py = (1-nx)*imgH
-     * ROTATION_270 (landscape, home-button left):
-     * → px = (1-nx)*imgW, py = (1-ny)*imgH
-     */
-    private float[] viewToImagePoint(float sx, float sy,
-                                     float viewW, float viewH,
-                                     int imgW, int imgH) {
-        float nx = sx / viewW;
-        float ny = sy / viewH;
-        float px, py;
-        int rotation = getWindowManager().getDefaultDisplay().getRotation();
-        switch (rotation) {
-            case android.view.Surface.ROTATION_90:   // Landscape-right
-                px = nx * imgW;
-                py = ny * imgH;
-                break;
-            case android.view.Surface.ROTATION_270:  // Landscape-left
-                px = (1f - nx) * imgW;
-                py = (1f - ny) * imgH;
-                break;
-            case android.view.Surface.ROTATION_180:  // Portrait upside-down
-                px = ny * imgW;
-                py = (1f - nx) * imgH;
-                break;
-            default:                                  // ROTATION_0 = Portrait (most common)
-                px = (1f - ny) * imgW;
-                py = nx * imgH;
-                break;
-        }
-        return new float[]{px, py};
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Yaw Math  (mirrors iOS angleDifference)
+    // Yaw Math
     // ─────────────────────────────────────────────────────────────────────────
 
     private double angleDifference(double a, double b) {
@@ -1072,10 +945,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Continuous QR Detection via ML Kit  (mirrors iOS processARFrame + detectQRCode)
+    // Continuous QR Detection via ML Kit
     // ─────────────────────────────────────────────────────────────────────────
 
-    private boolean isProcessingFrame = false;   // mirrors iOS isProcessingFrame
+    private boolean isProcessingFrame = false;
 
     private void processARFrame(Frame frame) {
         if (isProcessingFrame) return;
@@ -1086,15 +959,13 @@ public class MainActivity extends AppCompatActivity {
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void scanQrFromArFrame(Frame frame) {
         try {
+            long frameTimestamp = frame.getTimestamp();
             android.media.Image cameraImage = frame.acquireCameraImage();
-            int rotDeg = getSensorToDisplayRotation();   // correct sensor→display rotation
 
-            InputImage inputImage = InputImage.fromMediaImage(cameraImage, rotDeg);
+            InputImage inputImage = InputImage.fromMediaImage(cameraImage, 0);
 
             scanner.process(inputImage)
                     .addOnSuccessListener(barcodes -> {
-                        // Mirror iOS: find the first QR barcode
-                        lastQrSeenTime = System.currentTimeMillis();
                         Barcode qr = null;
                         for (Barcode b : barcodes) {
                             if (b.getFormat() == Barcode.FORMAT_QR_CODE
@@ -1105,56 +976,71 @@ public class MainActivity extends AppCompatActivity {
                         }
 
                         if (qr == null) {
-
+                            // ML Kit is async and can miss the QR on individual frames
+                            // (motion blur, focus shift, partial occlusion). iOS Vision
+                            // is synchronous and more frame-consistent, so it can clear
+                            // immediately. Here we debounce: only treat the QR as truly
+                            // lost after QR_LOST_TIMEOUT_MS of consecutive misses.
                             long now = System.currentTimeMillis();
-                            boolean qrRecentlySeen = (now - lastQrSeenTime) < QR_LOST_TIMEOUT_MS;
+                            boolean qrTrulyLost = (now - lastQrSeenTime) > QR_LOST_TIMEOUT_MS;
 
-                            runOnUiThread(() -> {
-                                if (!qrRecentlySeen) {
+                            if (qrTrulyLost) {
+                                runOnUiThread(() -> {
                                     overlayView.setCorners(null);
-                                }
-
-                                if (!qrRecentlySeen) {
                                     lastDetectedCorners = null;
 
                                     if (lastPayload == null) {
                                         showStatus("Scan a QR code to begin");
                                     }
 
-                                    // Cancel only if really gone
+                                    // Cancel sampling if QR lost (mirrors iOS)
                                     if (isSampling) {
                                         isSampling = false;
                                         sampleBuffer.clear();
                                         showStatus("⚠️ QR lost during sampling. Try again.");
                                         dbBadge.setText("");
                                     }
-                                }
-                            });
+                                });
+                            }
 
                             return;
                         }
 
-                        // ── QR found — convert ML Kit pixel coords → view coords ──
+                        // ── QR found — update timestamp for debounce ──
+                        lastQrSeenTime = System.currentTimeMillis();
                         String payload = qr.getRawValue();
-                        List<float[]> cornersList = extractScreenCorners(qr, cameraImage, rotDeg);
+
+                        android.graphics.Point[] pts = qr.getCornerPoints();
+                        if (pts == null || pts.length != 4) return;
+
+                        // These are perfectly native IMAGE_PIXELS
+                        float[] imagePoints = new float[]{
+                                pts[0].x, pts[0].y, pts[1].x, pts[1].y,
+                                pts[2].x, pts[2].y, pts[3].x, pts[3].y
+                        };
+
+                        // 2. Ask ARCore to perfectly map the pixels to the screen for the UI overlay
+                        float[] viewPoints = new float[8];
+                        frame.transformCoordinates2d(
+                                com.google.ar.core.Coordinates2d.IMAGE_PIXELS, imagePoints,
+                                com.google.ar.core.Coordinates2d.VIEW, viewPoints
+                        );
+
+                        List<float[]> cornersList = new ArrayList<>();
+                        for (int i = 0; i < 4; i++) {
+                            cornersList.add(new float[]{viewPoints[i * 2], viewPoints[i * 2 + 1]});
+                        }
 
                         runOnUiThread(() -> {
                             lastDetectedCorners = cornersList;
                             overlayView.setCorners(cornersList);
-
-                            // Enable Register button when corners present (mirrors iOS)
-                            btnRegister.setEnabled(true);
-                            btnRegister.setAlpha(1f);
-
                             onQRPayloadDetected(payload);
 
-                            // Feed sample if actively collecting (mirrors iOS)
                             if (isSampling) {
-                                List<float[]> cornersForSampling =
-                                        (cornersList != null) ? cornersList : lastDetectedCorners;
-
-                                if (cornersForSampling != null) {
-                                    collectSample(frame, cornersForSampling);
+                                Frame currentFrame = arSceneView.getFrame();
+                                if (currentFrame != null && currentFrame.getTimestamp() == frameTimestamp) {
+                                    // 3. Pass the RAW imagePoints directly to the math!
+                                    collectSample(currentFrame, imagePoints);
                                 }
                             }
                         });
@@ -1163,7 +1049,7 @@ public class MainActivity extends AppCompatActivity {
                             Log.w(TAG, "ML Kit barcode scan failed", e))
                     .addOnCompleteListener(task -> {
                         cameraImage.close();
-                        isProcessingFrame = false;   // mirrors iOS defer { isProcessingFrame = false }
+                        isProcessingFrame = false;
                     });
 
         } catch (Exception e) {
@@ -1173,55 +1059,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Helper: extract SCREEN-space corners from ML Kit barcode
-    // Corner order: [TL, TR, BR, BL]  (same as iOS Vision)
-    //
-    // ML Kit returns corners in the coordinate space of the InputImage that was
-    // passed to it.  InputImage.fromMediaImage(image, rotationDegrees) tells ML
-    // Kit to rotate the image before analysis, so its corners come back in
-    // *screen-upright* pixel coordinates — (0,0) = top-left of the screen,
-    // dimensions = the image size AFTER the rotation is applied:
-    //   rotDeg 90 or 270 → analysisW = sensorH, analysisH = sensorW
-    //   rotDeg 0  or 180 → analysisW = sensorW, analysisH = sensorH
-    //
-    // We normalise by those analysis dimensions then scale to view pixels so
-    // the overlay draws exactly on the QR code and hitTest gets the right point.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private List<float[]> extractScreenCorners(Barcode barcode,
-                                               android.media.Image cameraImage,
-                                               int rotationDeg) {
-        int sensorW = cameraImage.getWidth();
-        int sensorH = cameraImage.getHeight();
-        int analysisW = (rotationDeg == 90 || rotationDeg == 270) ? sensorH : sensorW;
-        int analysisH = (rotationDeg == 90 || rotationDeg == 270) ? sensorW : sensorH;
-
-        float viewW = arSceneView.getWidth();
-        float viewH = arSceneView.getHeight();
-
-        android.graphics.Point[] pts = barcode.getCornerPoints();
-        if (pts == null || pts.length != 4) {
-            android.graphics.Rect rect = barcode.getBoundingBox();
-            if (rect == null) return null;
-            pts = new android.graphics.Point[]{
-                    new android.graphics.Point(rect.left, rect.top),
-                    new android.graphics.Point(rect.right, rect.top),
-                    new android.graphics.Point(rect.right, rect.bottom),
-                    new android.graphics.Point(rect.left, rect.bottom)
-            };
-        }
-
-        List<float[]> list = new ArrayList<>();
-        for (android.graphics.Point p : pts) {
-            float nx = p.x / (float) analysisW;   // normalise to [0,1]
-            float ny = p.y / (float) analysisH;
-            list.add(new float[]{nx * viewW, ny * viewH});  // scale to view pixels
-        }
-        return list;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // UI Helpers  (mirrors iOS updateInfoLabel / showStatus / log / relativeDate)
+    // UI Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
     private enum InfoSource {DATABASE, FRESH_REGISTER}
@@ -1268,81 +1106,25 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * Returns the rotation that must be applied to a rear-camera image so that
-     * it appears upright on screen — i.e. the value to pass to
-     * InputImage.fromMediaImage(image, rotationDegrees).
-     * <p>
-     * Most Android phones have a rear sensor that is mounted in landscape
-     * (its natural axis is 90° from the display's natural axis).  The
-     * surface rotation tells us how the display is currently oriented relative
-     * to its own natural (portrait) position.  We combine both to get the
-     * angle needed to make the image upright.
-     * <p>
-     * Typical rear-camera sensor orientation = 90° (stored in
-     * CameraCharacteristics.SENSOR_ORIENTATION).  Rather than querying
-     * Camera2 every frame we use the well-known default and handle the
-     * display rotation on top of it.
-     * <p>
-     * Formula:  (sensorOrientation - displayRotationDeg + 360) % 360
-     * For sensor = 90°:
-     * ROTATION_0   (portrait)              → (90 -   0 + 360) % 360 = 90
-     * ROTATION_90  (landscape, home right) → (90 -  90 + 360) % 360 = 0
-     * ROTATION_270 (landscape, home left)  → (90 - 270 + 360) % 360 = 180
-     * ROTATION_180 (portrait upside-down)  → (90 - 180 + 360) % 360 = 270
+     * Mirrors iOS rec.appVersion shown in history dialog
      */
-    private int getSensorToDisplayRotation() {
-        // Query the actual sensor orientation via Camera2 so we handle
-        // devices where the sensor is mounted at 270° (front camera, tablets).
-        int sensorOrientation = 90; // safe default for rear camera on phones
+    private String getAppVersion() {
         try {
-            android.hardware.camera2.CameraManager cm =
-                    (android.hardware.camera2.CameraManager) getSystemService(CAMERA_SERVICE);
-            for (String id : cm.getCameraIdList()) {
-                android.hardware.camera2.CameraCharacteristics chars =
-                        cm.getCameraCharacteristics(id);
-                Integer facing = chars.get(
-                        android.hardware.camera2.CameraCharacteristics.LENS_FACING);
-                if (facing != null &&
-                        facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK) {
-                    Integer so = chars.get(
-                            android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION);
-                    if (so != null) sensorOrientation = so;
-                    break;
-                }
-            }
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Exception e) {
-            Log.w(TAG, "Could not query sensor orientation, using default 90°");
+            return "unknown";
         }
-
-        int displayRotationDeg;
-        switch (getWindowManager().getDefaultDisplay().getRotation()) {
-            case android.view.Surface.ROTATION_90:
-                displayRotationDeg = 90;
-                break;
-            case android.view.Surface.ROTATION_180:
-                displayRotationDeg = 180;
-                break;
-            case android.view.Surface.ROTATION_270:
-                displayRotationDeg = 270;
-                break;
-            default:
-                displayRotationDeg = 0;
-                break;
-        }
-        return (sensorOrientation - displayRotationDeg + 360) % 360;
     }
 
     private double getARCameraYawDegrees(Frame frame) {
-
         float[] m = new float[16];
         frame.getCamera().getPose().toMatrix(m, 0);
 
-        // ARCore forward vector (+Z)
-        float fx = m[8];
-        float fz = m[10];
+        float fx = -m[8];
+        float fz = -m[10];
 
         double yaw = Math.toDegrees(Math.atan2(fx, fz));
-        if (yaw < 0) yaw += 360.0;
+        if (yaw < 0) yaw += 360;
 
         return yaw;
     }
