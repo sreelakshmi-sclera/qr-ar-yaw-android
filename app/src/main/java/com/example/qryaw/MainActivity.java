@@ -1,9 +1,9 @@
 package com.example.qryaw;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.pm.PackageManager;
-import android.hardware.Sensor;
-import android.hardware.SensorManager;
+import android.hardware.GeomagneticField;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
@@ -19,12 +19,16 @@ import androidx.camera.core.ExperimentalGetImage;
 import androidx.core.content.ContextCompat;
 
 import com.example.qryaw.db.QRDatabaseHelper;
+import com.google.android.gms.location.DeviceOrientation;
+import com.google.android.gms.location.DeviceOrientationListener;
+import com.google.android.gms.location.DeviceOrientationRequest;
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.FusedOrientationProviderClient;
+import com.google.android.gms.location.LocationServices;
+import com.google.android.gms.location.Priority;
 import com.google.ar.core.ArCoreApk;
-
-import io.github.sceneview.ar.ARSceneView;
-import kotlin.Unit;
-
 import com.google.ar.core.CameraIntrinsics;
+import com.google.ar.core.Config;
 import com.google.ar.core.Frame;
 import com.google.ar.core.TrackingState;
 import com.google.mlkit.vision.barcode.BarcodeScanner;
@@ -37,72 +41,73 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.Executors;
+
+import io.github.sceneview.ar.ARSceneView;
+import kotlin.Unit;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "QRYaws";
 
-    // ── Sampling config (mirrors iOS constants) ──
+    // ── Configuration Constants ──
     private static final int REQUIRED_SAMPLES = 8;
     private static final double MIN_SAMPLE_WEIGHT = 0.15;
     private static final double DEFAULT_TOLERANCE = 15.0;
+    private static final float HEADING_ERROR_GATE = 90.0f;
+    private static final int MAG_SAMPLES_REQUIRED = 40;
+    private static final long MAX_SAMPLE_GAP_MS = 400;
+    private static final long QR_LOST_TIMEOUT_MS = 500;
 
-    private long compassStartTime = 0;
-    private double compassSin = 0;
-    private double compassCos = 0;
-    private int compassSamples = 0;
-
-    // ── AR / UI ──
+    // ── UI Components ──
     private ARSceneView arSceneView;
     private QROverlayView overlayView;
-
     private TextView statusText, infoText, modeText, dbBadge;
+    private Button btnRecalibrate;
     private Button btnRegister;
     private Button btnValidate;
 
-    private final BarcodeScanner scanner =
-            BarcodeScanning.getClient(
-                    new BarcodeScannerOptions.Builder()
-                            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-                            .build()
-            );
-    // ── State (exact mirror of iOS ivars) ──
-    /**
-     * Last decoded QR text — used as the SQLite primary key
-     */
+    // ── Runtime State ──
+    private String magSamplesDisplay = null;
+    private final List<Double> magValidationBuffer = new ArrayList<>();
+    private boolean isCollectingMag = false;
+    private double samplingOffsetAnchor = Double.NaN;
+    private double lastRawMagHeading = Double.NaN;
     private String lastPayload;
-    private QRDatabaseHelper.Registration currentRegistration;   // == registration in iOS
+    private QRDatabaseHelper.Registration currentRegistration;
     private boolean isSampling = false;
     private SamplingPurpose purpose = SamplingPurpose.REGISTER;
     private final List<YawSample> sampleBuffer = new ArrayList<>();
     private long lastSampleTime = 0;
-    /**
-     * Max gap between consecutive samples — if exceeded, restart sampling
-     * because the QR was lost long enough that the user may have shifted.
-     */
-    private static final long MAX_SAMPLE_GAP_MS = 400;
-    /**
-     * Last detected screen corners — updated when QR is found, cleared when lost
-     */
     private List<float[]> lastDetectedCorners;
-
-    // ── QR-lost debounce ──
-    // ML Kit is async and can miss QR on individual frames (motion blur, focus, etc.)
-    // unlike iOS Vision which runs synchronously and is more frame-consistent.
-    // We debounce the "QR lost" signal: only clear after several consecutive misses.
     private long lastQrSeenTime = 0;
-    private static final long QR_LOST_TIMEOUT_MS = 500;
+    private boolean isProcessingFrame = false;
+
+    // ── Services ──
+    private FusedOrientationProviderClient fusedOrientationClient;
+    private FusedLocationProviderClient locationClient;
+    private final BarcodeScanner scanner = BarcodeScanning.getClient(
+            new BarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                    .build()
+    );
 
     private enum SamplingPurpose {REGISTER, VALIDATE}
 
-    // ── Inner data classes ──
+    private enum ScanMode {REGISTER, VALIDATE}
+
+    private enum InfoSource {DATABASE, FRESH_REGISTER}
+
+    // ── Inner Data Classes ──
     private static class YawSample {
         final double yaw;
+        final double northYaw;
         final double weight;
 
-        YawSample(double y, double w) {
-            yaw = y;
-            weight = w;
+        YawSample(double yaw, double northYaw, double weight) {
+            this.yaw = yaw;
+            this.northYaw = northYaw;
+            this.weight = weight;
         }
     }
 
@@ -118,10 +123,138 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Vector Math Helpers  (port of iOS SIMD calls)
-    // ─────────────────────────────────────────────────────────────────────────
+    private void flushSensors() {
+        log("Manual Recalibration Triggered: Flushing sensors.");
 
+        // 1. Stop FOP
+        stopFOP();
+
+        // 2. Reset ALL app state
+        resetAlignment();
+        lastPayload = null;
+        currentRegistration = null;
+        isSampling = false;
+        isCollectingMag = false;
+        sampleBuffer.clear();
+        magValidationBuffer.clear();
+        magSamplesDisplay = null;
+        lastSampleTime = 0;
+        lastDetectedCorners = null;
+        lastQrSeenTime = 0;
+        isProcessingFrame = false;
+
+        // 3. Destroy and recreate ARSceneView for a fresh session
+        android.view.ViewGroup parent = (android.view.ViewGroup) arSceneView.getParent();
+        int index = parent.indexOfChild(arSceneView);
+        android.view.ViewGroup.LayoutParams params = arSceneView.getLayoutParams();
+
+        arSceneView.destroy();
+        parent.removeView(arSceneView);
+
+        arSceneView = new ARSceneView(this);
+        parent.addView(arSceneView, index, params);
+
+        arSceneView.setSessionConfiguration((session, config) -> {
+            config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
+            return null;
+        });
+
+        // 4. Update UI
+        runOnUiThread(() -> {
+            overlayView.setCorners(null);
+            statusText.setText("♻️ Full Reset.\nPlease hold still to re-align.");
+            dbBadge.setText("Recalibrated ✓");
+            infoText.setText("");
+            modeText.setText("MODE: WAITING");
+            btnRegister.setEnabled(false);
+            btnValidate.setEnabled(false);
+            btnRegister.setAlpha(0.5f);
+            btnValidate.setAlpha(0.5f);
+        });
+
+        // 5. Restart with delay to let camera release
+        arSceneView.postDelayed(() -> {
+            checkArCoreAndStart();
+            startFOP();
+            log("Fresh session + FOP started.");
+        }, 500);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Device Orientation Listener
+    // ─────────────────────────────────────────────────────────────────────────
+    private final DeviceOrientationListener fopListener = new DeviceOrientationListener() {
+        @Override
+        public void onDeviceOrientationChanged(DeviceOrientation orientation) {
+            float headingError = orientation.getHeadingErrorDegrees();
+
+            if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
+                if (isCollectingMag) {
+                    runOnUiThread(() -> showStatus("⚠️ Compass interference.\nPlease move phone in a figure-8."));
+                }
+                return;
+            }
+
+            runOnUiThread(() -> {
+                lastRawMagHeading = orientation.getHeadingDegrees();
+
+                // Collect 40 samples strictly ON DEMAND
+                if (isCollectingMag) {
+                    Frame frame = arSceneView.getFrame();
+                    if (frame == null || frame.getCamera().getTrackingState() != TrackingState.TRACKING)
+                        return;
+
+                    double arYaw = getARCameraYawDegrees(frame);
+                    double targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0;
+
+                    magValidationBuffer.add(targetOffset);
+
+                    dbBadge.setText("🧭 Mag Samples: " + magValidationBuffer.size() + "/" + MAG_SAMPLES_REQUIRED);
+
+                    if (magValidationBuffer.size() >= MAG_SAMPLES_REQUIRED) {
+                        isCollectingMag = false;
+                        StringBuilder sb = new StringBuilder("\n=== 40 MAG SAMPLES CAPTURED ===\n");
+                        for (int i = 0; i < magValidationBuffer.size(); i++) {
+                            sb.append(String.format(Locale.US, "Mag Sample #%02d: %.2f°\n", i + 1, magValidationBuffer.get(i)));
+                        }
+                        Log.i(TAG, sb.toString());
+
+                        StringBuilder uiSb = new StringBuilder("🧲 40 MAG SAMPLES:\n");
+                        for (int i = 0; i < magValidationBuffer.size(); i++) {
+                            uiSb.append(String.format(Locale.US, "%5.1f°", magValidationBuffer.get(i)));
+                            if (i < magValidationBuffer.size() - 1) uiSb.append(", ");
+                            if ((i + 1) % 5 == 0 && i != magValidationBuffer.size() - 1) {
+                                uiSb.append("\n");
+                            }
+                        }
+                        magSamplesDisplay = uiSb.toString();
+
+                        double sumSin = 0;
+                        double sumCos = 0;
+                        for (double val : magValidationBuffer) {
+                            double rad = Math.toRadians(val);
+                            sumSin += Math.sin(rad);
+                            sumCos += Math.cos(rad);
+                        }
+
+                        samplingOffsetAnchor = Math.toDegrees(Math.atan2(sumSin / MAG_SAMPLES_REQUIRED, sumCos / MAG_SAMPLES_REQUIRED));
+                        if (samplingOffsetAnchor < 0) samplingOffsetAnchor += 360.0;
+
+                        isCollectingMag = false;
+
+                        showStatus("📐 North locked. Measuring QR...");
+                        dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
+
+                        log("Averaged " + MAG_SAMPLES_REQUIRED + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
+                    }
+                }
+            });
+        }
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Vector Math Helpers
+    // ─────────────────────────────────────────────────────────────────────────
     private static float[] vec3Scale(float[] v, float s) {
         return new float[]{v[0] * s, v[1] * s, v[2] * s};
     }
@@ -147,9 +280,6 @@ public class MainActivity extends AppCompatActivity {
         };
     }
 
-    /**
-     * Rotate a camera-space vector into world space using the ARCore camera pose matrix.
-     */
     private static float[] rotateCamToWorld(float[] camVec, float[] m) {
         return new float[]{
                 m[0] * camVec[0] + m[4] * camVec[1] + m[8] * camVec[2],
@@ -159,105 +289,24 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Permission launcher
+    // Lifecycle & Permissions
     // ─────────────────────────────────────────────────────────────────────────
-
-    private final ActivityResultLauncher<String> permissionLauncher =
-            registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {
-                if (granted) {
+    private final ActivityResultLauncher<String[]> permissionLauncher =
+            registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), permissions -> {
+                Boolean cameraGranted = permissions.getOrDefault(Manifest.permission.CAMERA, false);
+                if (cameraGranted != null && cameraGranted) {
                     checkArCoreAndStart();
+                    startFOP();
                 } else {
                     Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show();
                     finish();
                 }
             });
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Lifecycle
-    // ─────────────────────────────────────────────────────────────────────────
-
-    // ── Compass for North alignment (iOS gravityAndHeading equivalent) ──
-    private android.hardware.SensorManager sensorManager;
-    private final float[] orientation = new float[3];
-
-    private double arNorthOffsetDeg = Double.NaN;
-    private boolean compassReady = false;
-
-    private final android.hardware.SensorEventListener compassListener =
-            new android.hardware.SensorEventListener() {
-
-                @Override
-                public void onSensorChanged(android.hardware.SensorEvent event) {
-                    if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
-
-                        float[] rotationMatrix = new float[9];
-                        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-
-                        float[] remappedRotationMatrix = new float[9];
-                        SensorManager.remapCoordinateSystem(
-                                rotationMatrix,
-                                SensorManager.AXIS_X,
-                                SensorManager.AXIS_Z,
-                                remappedRotationMatrix);
-
-                        SensorManager.getOrientation(remappedRotationMatrix, orientation);
-
-                        double azimuthDeg = Math.toDegrees(orientation[0]);
-                        if (azimuthDeg < 0) azimuthDeg += 360.0;
-
-                        long now = System.currentTimeMillis();
-                        if (compassStartTime == 0) {
-                            compassStartTime = now;
-                        }
-
-                        // Keep your old 3-second locking logic!
-                        if (!compassReady) {
-                            Frame frame = arSceneView.getFrame();
-                            if (frame != null && frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
-
-                                double rad = Math.toRadians(azimuthDeg);
-                                compassSin += Math.sin(rad);
-                                compassCos += Math.cos(rad);
-                                compassSamples++;
-
-                                if (now - compassStartTime > 3000 && compassSamples > 15) {
-                                    double meanRad = Math.atan2(compassSin / compassSamples, compassCos / compassSamples);
-                                    double meanDeg = Math.toDegrees(meanRad);
-                                    if (meanDeg < 0) meanDeg += 360.0;
-
-                                    double arYaw = getARCameraYawDegrees(frame);
-                                    arNorthOffsetDeg = meanDeg - arYaw;
-                                    while (arNorthOffsetDeg < 0) arNorthOffsetDeg += 360;
-                                    while (arNorthOffsetDeg >= 360) arNorthOffsetDeg -= 360;
-
-                                    compassReady = true;
-                                    log("Compass locked at " + meanDeg + "° using ROTATION_VECTOR");
-
-                                    runOnUiThread(() -> {
-                                        dbBadge.setText("✅ Compass ready — North-anchored");
-                                        if (currentRegistration != null) {
-                                            setMode(ScanMode.VALIDATE);
-                                        } else if (lastPayload != null) {
-                                            setMode(ScanMode.REGISTER);
-                                        } else {
-                                            showStatus("Scan a QR code to begin");
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                @Override
-                public void onAccuracyChanged(android.hardware.Sensor sensor, int accuracy) {}
-            };
-
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        sensorManager = (android.hardware.SensorManager) getSystemService(SENSOR_SERVICE);
 
         arSceneView = findViewById(R.id.ar_scene_view);
         overlayView = findViewById(R.id.overlay_view);
@@ -267,6 +316,8 @@ public class MainActivity extends AppCompatActivity {
         dbBadge = findViewById(R.id.db_badge);
         btnRegister = findViewById(R.id.btn_register);
         btnValidate = findViewById(R.id.btn_validate);
+        btnRecalibrate = findViewById(R.id.btn_recalibrate);
+        btnRecalibrate.setOnClickListener(v -> flushSensors());
         Button btnHistory = findViewById(R.id.btn_history);
 
         btnRegister.setOnClickListener(v -> registerTapped());
@@ -275,35 +326,91 @@ public class MainActivity extends AppCompatActivity {
 
         log("DB path: " + QRDatabaseHelper.getInstance(this).getDatabasePath());
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED) {
+        fusedOrientationClient = LocationServices.getFusedOrientationProviderClient(this);
+        locationClient = LocationServices.getFusedLocationProviderClient(this);
+
+        arSceneView.setSessionConfiguration((session, config) -> {
+            config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
+            log("ARCore sessionConfiguration: HORIZONTAL_AND_VERTICAL enabled");
+            return null;
+        });
+
+        boolean hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
+
+        if (hasCamera) {
             checkArCoreAndStart();
         } else {
-            permissionLauncher.launch(Manifest.permission.CAMERA);
+            permissionLauncher.launch(new String[]{
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+            });
         }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        resetCompass();
-
-        sensorManager.registerListener(
-                compassListener,
-                sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR),
-                android.hardware.SensorManager.SENSOR_DELAY_UI);
+        resetAlignment();
+        startFOP();
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        sensorManager.unregisterListener(compassListener);
+        stopFOP();
+    }
+
+    @SuppressLint("MissingPermission")
+    private void startFOP() {
+        // 1. Wake up the GPS to guarantee FOP has the data it needs for True North
+        locationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
+                .addOnSuccessListener(location -> {
+                    if (location != null) {
+                        // 2. Explicitly calculate the declination for logging
+                        GeomagneticField field = new GeomagneticField(
+                                (float) location.getLatitude(),
+                                (float) location.getLongitude(),
+                                (float) location.getAltitude(),
+                                System.currentTimeMillis()
+                        );
+
+                        float declination = field.getDeclination();
+                        log("Location secured. Magnetic Declination is: " + String.format(Locale.US, "%.2f°", declination));
+                    } else {
+                        log("⚠️ Location is null. FOP may temporarily fall back to Magnetic North.");
+                    }
+                });
+
+        // 3. Start your existing FOP listener
+        DeviceOrientationRequest request = new DeviceOrientationRequest.Builder(
+                DeviceOrientationRequest.OUTPUT_PERIOD_FAST
+        ).build();
+
+        fusedOrientationClient
+                .requestOrientationUpdates(request, Executors.newSingleThreadExecutor(), fopListener)
+                .addOnSuccessListener(unused -> log("FOP: registration success"))
+                .addOnFailureListener(e -> {
+                    Log.e(TAG, "FOP: registration failed", e);
+                    runOnUiThread(() -> dbBadge.setText("⚠️ FOP unavailable — check Play Services"));
+                });
+    }
+
+    private void stopFOP() {
+        if (fusedOrientationClient != null) {
+            fusedOrientationClient.removeOrientationUpdates(fopListener);
+        }
+    }
+
+    private void resetAlignment() {
+        samplingOffsetAnchor = Double.NaN;
+        lastRawMagHeading = Double.NaN;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // AR Setup  (mirrors iOS setupAR + startARSession)
+    // AR Setup
     // ─────────────────────────────────────────────────────────────────────────
-
     private void checkArCoreAndStart() {
         ArCoreApk.getInstance().checkAvailabilityAsync(this, availability -> {
             if (availability.isTransient()) {
@@ -319,15 +426,6 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void resetCompass() {
-        compassReady = false;
-        compassStartTime = 0;
-        compassSin = 0;
-        compassCos = 0;
-        compassSamples = 0;
-        arNorthOffsetDeg = Double.NaN;
-    }
-
     private void initializeArSession() {
         try {
             arSceneView.getPlaneRenderer().setEnabled(false);
@@ -338,60 +436,52 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startArSession() {
-        resetCompass();
+        resetAlignment();
         btnRegister.setEnabled(false);
         btnRegister.setAlpha(0.5f);
         btnValidate.setEnabled(false);
         btnValidate.setAlpha(0.5f);
 
         showStatus("⏳ Compass stabilizing...\nPlease hold still for a moment.");
-        dbBadge.setText("📡 Aligning to North...");
+        dbBadge.setText("");
 
         arSceneView.setOnFrame(frameTime -> {
             Frame frame = arSceneView.getFrame();
             if (frame == null) return Unit.INSTANCE;
-            if (frame.getCamera().getTrackingState() != TrackingState.TRACKING)
-                return Unit.INSTANCE;
 
-            processARFrame(frame);
+            // Ensure we are tracking before we allow button interaction
+            if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
+
+                // Check if compass is ready. If it is, and we have a payload, enable buttons.
+                if (isAlignmentReady() && lastPayload != null) {
+                    runOnUiThread(() -> {
+                        // This forces the buttons to wake up if a QR is still in front of the lens
+                        setMode(currentRegistration != null ? ScanMode.VALIDATE : ScanMode.REGISTER);
+                    });
+                }
+
+                processARFrame(frame);
+            }
             return Unit.INSTANCE;
         });
-
-        arSceneView.postDelayed(() -> {
-            dbBadge.setText("✅ Compass ready — North-anchored");
-            showStatus("Scan a QR code to begin");
-
-            if (lastDetectedCorners != null) {
-                btnRegister.setEnabled(true);
-                btnRegister.setAlpha(1f);
-            }
-            if (currentRegistration != null) {
-                btnValidate.setEnabled(true);
-                btnValidate.setAlpha(1f);
-            }
-        }, 2000);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // QR Payload Detected → Auto-load from DB
+    // QR Payload Detected
     // ─────────────────────────────────────────────────────────────────────────
-
     private void onQRPayloadDetected(String payload) {
         if (payload.equals(lastPayload)) return;
         lastPayload = payload;
         currentRegistration = null;
 
-        QRDatabaseHelper.Registration record =
-                QRDatabaseHelper.getInstance(this).fetchRegistration(payload);
+        QRDatabaseHelper.Registration record = QRDatabaseHelper.getInstance(this).fetchRegistration(payload);
 
         if (record != null) {
             currentRegistration = record;
-
             setMode(ScanMode.VALIDATE);
             dbBadge.setText("📦 Loaded from DB  (registered " + relativeTime(record.registeredAt) + ")");
             showStatus("QR Detected ✓  —  Registration found in DB!\nPress VALIDATE to check orientation.");
-            updateInfoLabel(null, record, null, InfoSource.DATABASE);
-
+            updateInfoLabel(null, null, null, record, null, InfoSource.DATABASE);
             log("DB hit → payload=" + payload + " yaw=" + record.yaw + "°");
         } else {
             setMode(ScanMode.REGISTER);
@@ -399,12 +489,10 @@ public class MainActivity extends AppCompatActivity {
             showStatus("QR Detected ✓\nNo prior registration found.\nPress REGISTER to save yaw.");
             infoText.setText("Payload : " + payload.substring(0, Math.min(42, payload.length()))
                     + "\nStatus  : Not registered");
-
             log("DB miss → payload=" + payload);
         }
 
-        // Only enable buttons if compass is actually ready
-        if (compassReady) {
+        if (isAlignmentReady()) {
             btnRegister.setEnabled(true);
             btnRegister.setAlpha(1f);
             if (currentRegistration != null) {
@@ -414,16 +502,19 @@ public class MainActivity extends AppCompatActivity {
         } else {
             btnRegister.setEnabled(false);
             btnValidate.setEnabled(false);
-            showStatus("⏳ Waiting for Compass lock...");
+            showStatus("⏳ Waiting for North alignment...");
         }
+    }
+
+    private boolean isAlignmentReady() {
+        return !Double.isNaN(lastRawMagHeading);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Button Actions
     // ─────────────────────────────────────────────────────────────────────────
-
     private void registerTapped() {
-        if (!compassReady) {
+        if (!isAlignmentReady()) {
             showStatus("⏳ Compass still aligning. Please wait...");
             return;
         }
@@ -440,7 +531,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void validateTapped() {
-        if (!compassReady) {
+        if (!isAlignmentReady()) {
             showStatus("⏳ Compass still aligning. Please wait...");
             return;
         }
@@ -482,12 +573,12 @@ public class MainActivity extends AppCompatActivity {
                 break;
             }
         }
+
         if (reg != null) {
             msg.append(String.format(Locale.US, "Yaw      : %.1f°\n", reg.yaw));
             msg.append(String.format(Locale.US, "Tolerance: ±%.0f°\n", reg.tolerance));
             msg.append("Saved    : ").append(relativeTime(reg.registeredAt)).append("\n");
             msg.append("Device   : ").append(android.os.Build.MODEL).append("\n");
-            // FIX #1: Mirror iOS which shows appVersion in history
             msg.append("App      : ").append(getAppVersion()).append("\n");
         } else {
             msg.append("None found.\n");
@@ -524,14 +615,8 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Mode Switching  (mirrors iOS setMode(_:))
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private enum ScanMode {REGISTER, VALIDATE}
-
     private void setMode(ScanMode mode) {
-        boolean canClick = compassReady && !isSampling;
+        boolean canClick = isAlignmentReady() && !isSampling;
 
         switch (mode) {
             case REGISTER:
@@ -556,33 +641,110 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Sampling Engine
     // ─────────────────────────────────────────────────────────────────────────
-
     private void startSampling(SamplingPurpose p) {
         sampleBuffer.clear();
+        magValidationBuffer.clear();
+        magSamplesDisplay = null;
         purpose = p;
         isSampling = true;
-        lastSampleTime = 0;   // reset — first sample has no gap check
+        isCollectingMag = true;
+        lastSampleTime = 0;
+
         String action = (p == SamplingPurpose.REGISTER) ? "Registering" : "Validating";
-        showStatus("📐 " + action + "... hold still\n(collecting " + REQUIRED_SAMPLES + " samples)");
-        dbBadge.setText("🔄 Sampling 0/" + REQUIRED_SAMPLES + "...");
+        showStatus("🧭 " + action + "...\nFinding Magnetic North (0/" + MAG_SAMPLES_REQUIRED + ")");
+        dbBadge.setText("🔄 Mag Init...");
+
+        arSceneView.postDelayed(() -> {
+            if (!isSampling) return; // User might have cancelled
+            isCollectingMag = true;
+            showStatus("🧭 " + action + "...\nFinding Magnetic North (0/" + MAG_SAMPLES_REQUIRED + ")");
+            dbBadge.setText("🔄 Mag Init...");
+        }, 1500);
     }
 
-    private void collectSample(Frame frame, float[] imagePoints) {
-        QRMeasurement result = computeQRYawFromTopEdge(frame, imagePoints);
-        if (result == null) return;
+    private void collectSampleWithPose(float[] imagePoints, float[] camPose,
+                                       CameraIntrinsics intrinsics, Frame frame) {
+        log("[collectSampleWithPose] Using pre-captured pose. camOrigin=("
+                + String.format(Locale.US, "%.3f, %.3f, %.3f", camPose[12], camPose[13], camPose[14]) + ")");
+        QRMeasurement result = computeQRYawFromTopEdgeWithPose(imagePoints, camPose, intrinsics);
 
-        if (result.confidence < MIN_SAMPLE_WEIGHT) {
-            log(String.format(Locale.US,
-                    "Sample rejected (confidence %.2f < %.2f)", result.confidence, MIN_SAMPLE_WEIGHT));
+        if (result == null) {
+            log("[collectSampleWithPose] computeQRYaw returned null — skipping");
             return;
         }
 
-        log("method=" + result.method);
+        log(String.format(Locale.US, "[collectSampleWithPose] yaw=%.1f° conf=%.2f method=%s",
+                result.yaw, result.confidence, result.method));
+        processSample(result);
+    }
 
-        // ── Staleness check ──
-        // If there was a big gap since the last accepted sample, the QR was
-        // intermittently lost and the user may have shifted position. Discard
-        // all prior samples and restart the buffer from this sample.
+    private void logSampleBuffer() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n=== QR NORTH SAMPLES [").append(sampleBuffer.size()).append("/").append(REQUIRED_SAMPLES).append("] ===\n");
+        sb.append(String.format(Locale.US, "%-10s | %-10s | %-8s | %-8s\n", "ID", "NORTH", "RAW AR", "WEIGHT"));
+        sb.append("--------------------------------------------------\n");
+
+        for (int i = 0; i < sampleBuffer.size(); i++) {
+            YawSample s = sampleBuffer.get(i);
+            sb.append(String.format(Locale.US, "#%-9d | %-8.2f°  | %-8.2f° | %-6.2f\n",
+                    i + 1, s.northYaw, s.yaw, s.weight));
+        }
+        Log.i("SAMPLES", sb.toString());
+    }
+
+    private void updateFullSampleListUI(double latestNorth, double latestWeight) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("🛰️ SAMPLING NORTH BEARING\n");
+        sb.append("──────────────────────────\n");
+
+        for (int i = 0; i < sampleBuffer.size(); i++) {
+            YawSample s = sampleBuffer.get(i);
+            String indicator = (i == sampleBuffer.size() - 1) ? "▶ " : "  ";
+            sb.append(String.format(Locale.US, "%sSample #%d: %.2f°  (w: %.2f)\n",
+                    indicator, i + 1, s.northYaw, s.weight));
+        }
+
+        int progress = sampleBuffer.size();
+        sb.append("\nProgress: [");
+        for (int i = 0; i < REQUIRED_SAMPLES; i++) {
+            sb.append(i < progress ? "●" : "○");
+        }
+        sb.append("] " + progress + "/" + REQUIRED_SAMPLES);
+
+        runOnUiThread(() -> infoText.setText(sb.toString()));
+    }
+
+    private void processSample(QRMeasurement result) {
+        if (result.confidence < MIN_SAMPLE_WEIGHT) {
+            log(String.format(Locale.US, "Sample rejected (confidence %.2f < %.2f)", result.confidence, MIN_SAMPLE_WEIGHT));
+            return;
+        }
+
+        double sampleNorth = (result.yaw + samplingOffsetAnchor) % 360.0;
+        if (sampleNorth < 0) sampleNorth += 360.0;
+
+        // ── Outlier check BEFORE adding to buffer ──
+        if (!sampleBuffer.isEmpty()) {
+            double referenceYaw = circularWeightedMean(sampleBuffer);
+            double diff = Math.abs(angleDifference(referenceYaw, result.yaw));
+
+            if (diff > 45) {
+                if (result.confidence >= 1.0 && sampleBuffer.get(0).weight < 0.5) {
+                    log("[processSample] 🌟 High-confidence plane found! Discarding old low-confidence buffer.");
+                    sampleBuffer.clear();
+                } else {
+                    log(String.format(Locale.US,
+                            "[processSample] OUTLIER REJECTED: sample=%.1f° ref=%.1f° diff=%.1f°",
+                            result.yaw, referenceYaw, diff));
+                    return;
+                }
+            } else {
+                log(String.format(Locale.US,
+                        "[processSample] Sample OK: yaw=%.1f° ref=%.1f° diff=%.1f°",
+                        result.yaw, referenceYaw, diff));
+            }
+        }
+
         long now = System.currentTimeMillis();
         if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
             int discarded = sampleBuffer.size();
@@ -590,38 +752,33 @@ public class MainActivity extends AppCompatActivity {
             log(String.format(Locale.US,
                     "Sample gap %dms > %dms — discarded %d stale samples, restarting",
                     (now - lastSampleTime), MAX_SAMPLE_GAP_MS, discarded));
-            runOnUiThread(() ->
-                    dbBadge.setText("🔄 Gap detected — resampling 0/" + REQUIRED_SAMPLES));
+            runOnUiThread(() -> dbBadge.setText("🔄 Gap detected — resampling 0/" + REQUIRED_SAMPLES));
         }
         lastSampleTime = now;
 
-        if (!sampleBuffer.isEmpty()) {
+        sampleBuffer.add(new YawSample(result.yaw, sampleNorth, result.confidence));
+        logSampleBuffer();
+        updateFullSampleListUI(sampleNorth, result.confidence);
+        log("method=" + result.method);
 
-            double referenceYaw = circularWeightedMean(sampleBuffer);
-            double diff = Math.abs(angleDifference(referenceYaw, result.yaw));
-
-            if (diff > 45) {
-                log("Rejected sample due to yaw jump: " + result.yaw);
-                return;
-            }
-        }
-
-        sampleBuffer.add(new YawSample(result.yaw, result.confidence));
         log(String.format(Locale.US, "  Sample %d: yaw=%.1f° conf=%.2f [%s]",
                 sampleBuffer.size(), result.yaw, result.confidence, result.method));
 
         final String methodCopy = result.method;
         final int countCopy = sampleBuffer.size();
-        runOnUiThread(() ->
-                dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES
-                        + " [" + methodCopy + "]"));
+        runOnUiThread(() -> dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES + " [" + methodCopy + "]"));
 
         if (sampleBuffer.size() >= REQUIRED_SAMPLES) {
             isSampling = false;
+            StringBuilder sb = new StringBuilder("[processSample] ALL SAMPLES: ");
+            for (int i = 0; i < sampleBuffer.size(); i++) {
+                YawSample s = sampleBuffer.get(i);
+                sb.append(String.format(Locale.US, "#%d=%.1f°(w=%.2f) ", i + 1, s.yaw, s.weight));
+            }
+            log(sb.toString());
+
             double finalYaw = circularWeightedMean(sampleBuffer);
-            log(String.format(Locale.US,
-                    "Sampling complete. Averaged yaw = %.2f° from %d samples",
-                    finalYaw, sampleBuffer.size()));
+            log(String.format(Locale.US, "Sampling complete. Averaged yaw = %.2f° from %d samples", finalYaw, sampleBuffer.size()));
             sampleBuffer.clear();
             commitReading(finalYaw);
         }
@@ -641,32 +798,35 @@ public class MainActivity extends AppCompatActivity {
         return mean;
     }
 
-    /**
-     * Called once sampling is complete with the final averaged yaw.
-     * <p>
-     * FIX #3: Now applies North offset so yaw values are absolute compass bearings,
-     * matching iOS .gravityAndHeading behavior. Without this, registrations from
-     * one ARCore session could not be validated in another session because ARCore
-     * uses an arbitrary heading each time.
-     */
     private void commitReading(double rawYaw) {
         if (lastPayload == null) return;
 
+        double offsetToUse = samplingOffsetAnchor;
+
+        log("COMMIT READING DEBUG:");
+        log(" -> Raw AR Yaw (from math): " + rawYaw + "°");
+        log(" -> Offset USED: " + offsetToUse + "°");
+
         double yaw = rawYaw;
 
-        // APPLY THE COMPASS OFFSET HERE
-        if (!Double.isNaN(arNorthOffsetDeg)) {
-            yaw = (rawYaw + arNorthOffsetDeg) % 360.0;
+        if (!Double.isNaN(offsetToUse)) {
+            yaw = (rawYaw + offsetToUse) % 360.0;
             if (yaw < 0) yaw += 360.0;
         }
 
-        // Synthetic normal for DB compatibility (mirrors iOS)
+        samplingOffsetAnchor = Double.NaN;
+        log(" -> FINAL COMPASS BEARING: " + yaw + "°");
+
         double yawRad = Math.toRadians(yaw);
         float normalX = (float) Math.sin(yawRad);
         float normalZ = (float) Math.cos(yawRad);
 
         if (purpose == SamplingPurpose.REGISTER) {
-            // ── SAVE TO SQLite ──
+            getSharedPreferences("qryaw_offsets", MODE_PRIVATE)
+                    .edit()
+                    .putFloat("offset_" + lastPayload, (float) offsetToUse)
+                    .apply();
+
             Long dbId = QRDatabaseHelper.getInstance(this).saveRegistration(
                     lastPayload, yaw, normalX, 0.0, normalZ, DEFAULT_TOLERANCE);
 
@@ -690,83 +850,86 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 setMode(ScanMode.VALIDATE);
                 dbBadge.setText("💾 Saved to DB  (id=" + dbId + ")");
-                showStatus(String.format(Locale.US,
-                        "✅ Registered & Saved!\nYaw = %.1f°  |  id=%d", finalYaw, dbId));
-                updateInfoLabel(finalYaw, reg, null, InfoSource.FRESH_REGISTER);
+                showStatus(String.format(Locale.US, "✅ Registered & Saved!\nYaw = %.1f°  |  id=%d", finalYaw, dbId));
+                updateInfoLabel(rawYaw, finalYaw, offsetToUse, reg, null, InfoSource.FRESH_REGISTER);
             });
 
-            log(String.format(Locale.US,
-                    "Registered → payload=%s…  yaw=%.1f°  dbId=%d",
+            log(String.format(Locale.US, "Registered → payload=%s…  yaw=%.1f°  dbId=%d",
                     lastPayload.substring(0, Math.min(20, lastPayload.length())), yaw, dbId));
 
         } else {
-            // ── VALIDATE AGAINST DB ──
-            QRDatabaseHelper.Registration record =
-                    QRDatabaseHelper.getInstance(this).fetchRegistration(lastPayload);
+            QRDatabaseHelper.Registration record = QRDatabaseHelper.getInstance(this).fetchRegistration(lastPayload);
             if (record == null) {
                 showStatus("⚠️ No previous registration found.\nPress REGISTER first.");
                 setMode(ScanMode.REGISTER);
                 return;
             }
 
+            float regOffset = getSharedPreferences("qryaw_offsets", MODE_PRIVATE).getFloat("offset_" + lastPayload, Float.NaN);
+            boolean offsetDrifted = false;
+            double offsetDelta = 0;
+            if (!Float.isNaN(regOffset)) {
+                offsetDelta = Math.abs(angleDifference(regOffset, offsetToUse));
+                offsetDrifted = offsetDelta > 10.0;
+                log(String.format(Locale.US, "[VALIDATE] Offset check: regOffset=%.1f° currentOffset=%.1f° delta=%.1f° drifted=%b",
+                        regOffset, offsetToUse, offsetDelta, offsetDrifted));
+            }
+
             double delta = angleDifference(record.yaw, yaw);
+            log(String.format(Locale.US, "[VALIDATE] registeredYaw=%.1f° currentYaw=%.1f° delta=%+.1f° tolerance=±%.0f° result=%s",
+                    record.yaw, yaw, delta, DEFAULT_TOLERANCE, (Math.abs(delta) <= DEFAULT_TOLERANCE) ? "PASS" : "FAIL"));
             boolean within = Math.abs(delta) <= DEFAULT_TOLERANCE;
 
             QRDatabaseHelper.getInstance(this).saveValidation(
                     record.id, lastPayload, yaw, record.yaw, delta, within, DEFAULT_TOLERANCE);
 
             double finalYaw1 = yaw;
+
             runOnUiThread(() -> {
                 String icon = within ? "✅" : "❌";
                 String moved = within ? "NOT moved" : "MOVED";
-                showStatus(String.format(Locale.US,
-                        "%s QR has %s\nΔYaw = %+.1f°   (±%.0f° tolerance)",
+                showStatus(String.format(Locale.US, "%s QR has %s\nΔYaw = %+.1f°   (±%.0f° tolerance)",
                         icon, moved, delta, DEFAULT_TOLERANCE));
                 dbBadge.setText("📝 Validation logged to DB");
-                updateInfoLabel(finalYaw1, record, delta, InfoSource.DATABASE);
+                updateInfoLabel(rawYaw, finalYaw1, offsetToUse, record, delta, InfoSource.DATABASE);
             });
 
-            log(String.format(Locale.US,
-                    "Validate → payload=%s…\n           current=%.1f°\n           registered=%.1f°\n           Δ=%+.1f°\n           yawOK=%b",
+            log(String.format(Locale.US, "Validate → payload=%s…\n           current=%.1f°\n           registered=%.1f°\n           Δ=%+.1f°\n           yawOK=%b",
                     lastPayload.substring(0, Math.min(20, lastPayload.length())),
                     yaw, record.yaw, delta, within));
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Core: Compute QR World Yaw via ARCore  (mirrors iOS computeQRYawFromTopEdge)
+    // Core: Compute QR World Yaw via ARCore
     // ─────────────────────────────────────────────────────────────────────────
-
     private QRMeasurement computeQRYawFromTopEdge(Frame frame, float[] imagePoints) {
         com.google.ar.core.Camera camera = frame.getCamera();
         if (camera.getTrackingState() != TrackingState.TRACKING) return null;
 
-        CameraIntrinsics intr = camera.getImageIntrinsics();
-        float[] focal = intr.getFocalLength();
-        float[] pp = intr.getPrincipalPoint();
-
-        float fx = focal[0];
-        float fy = focal[1];
-        float cx = pp[0];
-        float cy = pp[1];
-
         float[] camPose = new float[16];
         camera.getPose().toMatrix(camPose, 0);
 
-        float[] camOrigin = {
-                camPose[12],
-                camPose[13],
-                camPose[14]
-        };
+        return computeQRYawFromTopEdgeWithPose(imagePoints, camPose, camera.getImageIntrinsics());
+    }
+
+    // Notice: The 'Frame frame' parameter is completely removed.
+    // We only need the raw math arrays.
+    private QRMeasurement computeQRYawFromTopEdgeWithPose(float[] imagePoints, float[] camPose,
+                                                          CameraIntrinsics intr) {
+        float[] focal = intr.getFocalLength();
+        float[] pp = intr.getPrincipalPoint();
+
+        float fx = focal[0], fy = focal[1], cx = pp[0], cy = pp[1];
+        float[] camOrigin = {camPose[12], camPose[13], camPose[14]};
 
         float[][] imgPts = {
-                {imagePoints[0], imagePoints[1]}, // TL
-                {imagePoints[2], imagePoints[3]}, // TR
-                {imagePoints[4], imagePoints[5]}, // BR
-                {imagePoints[6], imagePoints[7]}  // BL
+                {imagePoints[0], imagePoints[1]},
+                {imagePoints[2], imagePoints[3]},
+                {imagePoints[4], imagePoints[5]},
+                {imagePoints[6], imagePoints[7]}
         };
 
-        // ── Build world rays ──
         float[][] rays = new float[4][];
         for (int i = 0; i < 4; i++) {
             float xn = (imgPts[i][0] - cx) / fx;
@@ -775,77 +938,69 @@ public class MainActivity extends AppCompatActivity {
             rays[i] = vec3Normalize(rotateCamToWorld(camRay, camPose));
         }
 
-        float[] planeNormal = null;
-        float[] planePoint = null;
-        String method = "angle-solve";
+        String method = "vanishing-point";
+
+        // 1. Calculate Normal directly from Vanishing Points (No Hit Testing)
+        float[] planeNormal = computeNormalViaVanishingPoint(imgPts[0], imgPts[1], imgPts[2], imgPts[3], focal, pp, camPose);
 
         if (planeNormal == null) {
-            planeNormal = computeNormalViaVanishingPoint(
-                    imgPts[0], imgPts[1], imgPts[2], imgPts[3],
-                    focal, pp, camPose);
-
-            if (planeNormal != null) {
-                float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
-                planePoint = new float[]{
-                        camOrigin[0] + camFwd[0],
-                        camOrigin[1] + camFwd[1],
-                        camOrigin[2] + camFwd[2]
-                };
-                method = "vanishing-point";
-            }
+            log("[yawCalc] Vanishing-point solve failed — no normal available");
+            return null;
         }
 
-        if (planeNormal == null || planePoint == null) return null;
+        // 2. Estimate a generic plane point right in front of the camera
+        float[] camFwd2 = {-camPose[8], -camPose[9], -camPose[10]};
+        float[] planePoint = new float[]{
+                camOrigin[0] + camFwd2[0] * 0.5f,
+                camOrigin[1] + camFwd2[1] * 0.5f,
+                camOrigin[2] + camFwd2[2] * 0.5f
+        };
 
-        // ── Ensure normal faces camera (Points OUT of the wall) ──
+        // 3. Ensure Normal is facing the camera
         float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
-        if (vec3Dot(planeNormal, camFwd) > 0) {
+        float dotNormalCamFwd = vec3Dot(planeNormal, camFwd);
+        if (dotNormalCamFwd < 0) {
             planeNormal = vec3Scale(planeNormal, -1f);
+            log(String.format(Locale.US, "[yawCalc] Normal flipped (dot=%.3f) → now=(%.3f,%.3f,%.3f)",
+                    dotNormalCamFwd, planeNormal[0], planeNormal[1], planeNormal[2]));
         }
 
-        // ── Ray-plane intersection ──
+        // 4. Intersect Rays to find 3D Top-Left and Bottom-Left corners
         float[] tl3D = intersectPlane(camOrigin, rays[0], planePoint, planeNormal);
         float[] bl3D = intersectPlane(camOrigin, rays[3], planePoint, planeNormal);
 
-        if (tl3D == null || bl3D == null) return null;
-
-        // ── Extract yaw ──
-        float nx = planeNormal[0];
-        float nz = planeNormal[2];
-        double nxzLen = Math.hypot(nx, nz);
-
-        double hx, hz;
-
-        if (nxzLen > 0.15) {
-            hx = nx;
-            hz = nz;
-        } else {
-            float[] qrUp = {
-                    tl3D[0] - bl3D[0],
-                    tl3D[1] - bl3D[1],
-                    tl3D[2] - bl3D[2]
-            };
-            qrUp = vec3Normalize(qrUp);
-            hx = qrUp[0];
-            hz = qrUp[2];
-            if (Math.hypot(hx, hz) < 0.15) return null;
+        if (tl3D == null || bl3D == null) {
+            log("[yawCalc] Ray-plane intersection failed");
+            return null;
         }
 
-        double yaw = Math.toDegrees(Math.atan2(hx, hz));
+        // 5. FORCE "FLOOR" LOGIC (This fixes the 90-degree flip bug!)
+        // We ignore the noisy normal vector length and strictly measure the ink rotation.
+        float[] qrUp = vec3Normalize(new float[]{tl3D[0] - bl3D[0], tl3D[1] - bl3D[1], tl3D[2] - bl3D[2]});
+        double hx = qrUp[0];
+        double hz = qrUp[2];
+
+        if (Math.hypot(hx, hz) < 0.15) {
+            log("[yawCalc] Floor case: QR up-vector too vertical");
+            return null;
+        }
+
+        String yawSource = "FLOOR (QR up-vector)";
+
+        // 6. Final Angle Calculation
+        double yaw = Math.toDegrees(Math.atan2(hx, -hz));
         if (yaw < 0) yaw += 360;
 
-        double baseConf = method.equals("plane-detected") ? 1.0 :
-                method.equals("lidar-depth") ? 0.7 : 0.4;
-        double vertConf = nxzLen > 0.15 ? nxzLen : 1.0;
-        double confidence = baseConf * vertConf;
+        // Since we are strictly VP, we give it a solid confidence base
+        double confidence = 0.8;
+
+        log(String.format(Locale.US, "[yawCalc] RESULT: rawYaw=%.1f° conf=%.2f method=%s src=%s", yaw, confidence, method, yawSource));
 
         return new QRMeasurement(yaw, confidence, method);
     }
 
-    private float[] intersectPlane(
-            float[] camOrigin, float[] rayDir,
-            float[] planePoint, float[] planeNormal) {
-
+    private float[] intersectPlane(float[] camOrigin, float[] rayDir,
+                                   float[] planePoint, float[] planeNormal) {
         float denom = vec3Dot(rayDir, planeNormal);
         if (Math.abs(denom) < 1e-5) return null;
 
@@ -868,18 +1023,13 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Vanishing Point Normal Solve
     // ─────────────────────────────────────────────────────────────────────────
-
     private float[] computeNormalViaVanishingPoint(
             float[] imgTL, float[] imgTR, float[] imgBR, float[] imgBL,
-            float[] focalLength, float[] principalPt,
-            float[] camTransform) {
+            float[] focalLength, float[] principalPt, float[] camTransform) {
         try {
-            float fx = focalLength[0];
-            float fy = focalLength[1];
-            float cx = principalPt[0];
-            float cy = principalPt[1];
+            float fx = focalLength[0], fy = focalLength[1];
+            float cx = principalPt[0], cy = principalPt[1];
 
-// Use the perfectly mapped coordinates directly
             float[] hTL = {imgTL[0], imgTL[1], 1f};
             float[] hTR = {imgTR[0], imgTR[1], 1f};
             float[] hBR = {imgBR[0], imgBR[1], 1f};
@@ -907,8 +1057,12 @@ public class MainActivity extends AppCompatActivity {
             }
 
             float[] normalCam = vec3Normalize(vec3Cross(rayX, rayY));
-
             if (normalCam[2] < 0) normalCam = vec3Scale(normalCam, -1f);
+
+            float displayX = normalCam[1];
+            float displayY = -normalCam[0];
+            float displayZ = normalCam[2];
+            float[] normalCamDisplay = {displayX, displayY, displayZ};
 
             float[] normalWorld = rotateCamToWorld(normalCam, camTransform);
 
@@ -918,7 +1072,6 @@ public class MainActivity extends AppCompatActivity {
                     normalWorld[0], normalWorld[1], normalWorld[2]));
 
             return normalWorld;
-
         } catch (Exception e) {
             Log.e(TAG, "Vanishing point solve failed", e);
             return null;
@@ -932,11 +1085,9 @@ public class MainActivity extends AppCompatActivity {
         return vec3Normalize(new float[]{x, -y, -w});
     }
 
-
     // ─────────────────────────────────────────────────────────────────────────
     // Yaw Math
     // ─────────────────────────────────────────────────────────────────────────
-
     private double angleDifference(double a, double b) {
         double diff = b - a;
         while (diff > 180) diff -= 360;
@@ -947,9 +1098,6 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Continuous QR Detection via ML Kit
     // ─────────────────────────────────────────────────────────────────────────
-
-    private boolean isProcessingFrame = false;
-
     private void processARFrame(Frame frame) {
         if (isProcessingFrame) return;
         isProcessingFrame = true;
@@ -959,13 +1107,21 @@ public class MainActivity extends AppCompatActivity {
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void scanQrFromArFrame(Frame frame) {
         try {
-            long frameTimestamp = frame.getTimestamp();
             android.media.Image cameraImage = frame.acquireCameraImage();
 
+            CameraIntrinsics capturedIntrinsics = frame.getCamera().getImageIntrinsics();
+            float[] capturedPose = new float[16];
+            frame.getCamera().getPose().toMatrix(capturedPose, 0);
+
             InputImage inputImage = InputImage.fromMediaImage(cameraImage, 0);
+            final Frame capturedFrame = frame;
 
             scanner.process(inputImage)
                     .addOnSuccessListener(barcodes -> {
+                        if (arSceneView == null || arSceneView.getSession() == null) {
+                            return;
+                        }
+
                         Barcode qr = null;
                         for (Barcode b : barcodes) {
                             if (b.getFormat() == Barcode.FORMAT_QR_CODE
@@ -976,11 +1132,6 @@ public class MainActivity extends AppCompatActivity {
                         }
 
                         if (qr == null) {
-                            // ML Kit is async and can miss the QR on individual frames
-                            // (motion blur, focus shift, partial occlusion). iOS Vision
-                            // is synchronous and more frame-consistent, so it can clear
-                            // immediately. Here we debounce: only treat the QR as truly
-                            // lost after QR_LOST_TIMEOUT_MS of consecutive misses.
                             long now = System.currentTimeMillis();
                             boolean qrTrulyLost = (now - lastQrSeenTime) > QR_LOST_TIMEOUT_MS;
 
@@ -988,43 +1139,41 @@ public class MainActivity extends AppCompatActivity {
                                 runOnUiThread(() -> {
                                     overlayView.setCorners(null);
                                     lastDetectedCorners = null;
-
-                                    if (lastPayload == null) {
-                                        showStatus("Scan a QR code to begin");
-                                    }
-
-                                    // Cancel sampling if QR lost (mirrors iOS)
+                                    if (lastPayload == null) showStatus("Scan a QR code to begin");
                                     if (isSampling) {
                                         isSampling = false;
+                                        isCollectingMag = false;
                                         sampleBuffer.clear();
+                                        magValidationBuffer.clear();
                                         showStatus("⚠️ QR lost during sampling. Try again.");
                                         dbBadge.setText("");
                                     }
                                 });
                             }
-
                             return;
                         }
 
-                        // ── QR found — update timestamp for debounce ──
                         lastQrSeenTime = System.currentTimeMillis();
                         String payload = qr.getRawValue();
 
                         android.graphics.Point[] pts = qr.getCornerPoints();
                         if (pts == null || pts.length != 4) return;
 
-                        // These are perfectly native IMAGE_PIXELS
                         float[] imagePoints = new float[]{
                                 pts[0].x, pts[0].y, pts[1].x, pts[1].y,
                                 pts[2].x, pts[2].y, pts[3].x, pts[3].y
                         };
 
-                        // 2. Ask ARCore to perfectly map the pixels to the screen for the UI overlay
                         float[] viewPoints = new float[8];
-                        frame.transformCoordinates2d(
-                                com.google.ar.core.Coordinates2d.IMAGE_PIXELS, imagePoints,
-                                com.google.ar.core.Coordinates2d.VIEW, viewPoints
-                        );
+                        try {
+                            capturedFrame.transformCoordinates2d(
+                                    com.google.ar.core.Coordinates2d.IMAGE_PIXELS, imagePoints,
+                                    com.google.ar.core.Coordinates2d.VIEW, viewPoints
+                            );
+                        } catch (Exception e) {
+                            Log.w(TAG, "transformCoordinates2d failed (stale frame)", e);
+                            return;
+                        }
 
                         List<float[]> cornersList = new ArrayList<>();
                         for (int i = 0; i < 4; i++) {
@@ -1036,17 +1185,12 @@ public class MainActivity extends AppCompatActivity {
                             overlayView.setCorners(cornersList);
                             onQRPayloadDetected(payload);
 
-                            if (isSampling) {
-                                Frame currentFrame = arSceneView.getFrame();
-                                if (currentFrame != null && currentFrame.getTimestamp() == frameTimestamp) {
-                                    // 3. Pass the RAW imagePoints directly to the math!
-                                    collectSample(currentFrame, imagePoints);
-                                }
+                            if (isSampling && !isCollectingMag) {
+                                collectSampleWithPose(imagePoints, capturedPose, capturedIntrinsics, capturedFrame);
                             }
                         });
                     })
-                    .addOnFailureListener(e ->
-                            Log.w(TAG, "ML Kit barcode scan failed", e))
+                    .addOnFailureListener(e -> Log.w(TAG, "ML Kit barcode scan failed", e))
                     .addOnCompleteListener(task -> {
                         cameraImage.close();
                         isProcessingFrame = false;
@@ -1061,30 +1205,61 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // UI Helpers
     // ─────────────────────────────────────────────────────────────────────────
-
-    private enum InfoSource {DATABASE, FRESH_REGISTER}
-
-    private void updateInfoLabel(Double currentYaw,
-                                 QRDatabaseHelper.Registration reg,
-                                 Double delta,
-                                 InfoSource source) {
+// ─────────────────────────────────────────────────────────────────────────
+// UI Helpers
+// ─────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
+// UI Helpers
+// ─────────────────────────────────────────────────────────────────────────
+    private void updateInfoLabel(Double rawYaw, Double finalYaw, Double currentOffset,
+                                 QRDatabaseHelper.Registration reg, Double delta, InfoSource source) {
         List<String> lines = new ArrayList<>();
-        if (lastPayload != null)
+
+        // 1. Raw Mag Samples Dump
+        if (magSamplesDisplay != null) {
+            lines.add(magSamplesDisplay);
+            lines.add("──────────────────────────");
+        }
+
+        // 2. QR Info
+        if (lastPayload != null) {
             lines.add("QR      : " + lastPayload.substring(0, Math.min(38, lastPayload.length())));
+            lines.add("──────────────────────────");
+        }
+
+        // 3. REGISTRATION MATH (Historical)
         if (reg != null) {
-            lines.add(String.format(Locale.US, "Reg Yaw : %.1f°", reg.yaw));
-            lines.add("DB id   : " + reg.id);
-            lines.add("Source  : " + (source == InfoSource.DATABASE ? "📦 DB" : "💾 New")
+            float regOffset = getSharedPreferences("qryaw_offsets", MODE_PRIVATE)
+                    .getFloat("offset_" + lastPayload, Float.NaN);
+
+            lines.add("💾 REGISTRATION DATA:");
+            lines.add("Source  : " + (source == InfoSource.DATABASE ? "📦 DB" : "🆕 New")
                     + "  (" + relativeTime(reg.registeredAt) + ")");
+
+            // Reverse-engineer the raw AR yaw from the DB using the saved offset
+            if (!Float.isNaN(regOffset)) {
+                double rawRegYaw = (reg.yaw - regOffset + 360.0) % 360.0;
+                lines.add(String.format(Locale.US, "Math    : [%.1f° raw] + [%.1f° offset]", rawRegYaw, regOffset));
+            }
+            lines.add(String.format(Locale.US, "Reg Yaw : %.1f°", reg.yaw));
+            lines.add("──────────────────────────");
         }
-        if (currentYaw != null)
-            lines.add(String.format(Locale.US, "Cur Yaw : %.1f°", currentYaw));
+
+        // 4. CURRENT SCAN MATH (Live)
+        if (finalYaw != null && rawYaw != null && currentOffset != null) {
+            lines.add("🧭 CURRENT SCAN DATA:");
+            lines.add(String.format(Locale.US, "Math    : [%.1f° raw] + [%.1f° offset]", rawYaw, currentOffset));
+            lines.add(String.format(Locale.US, "Cur Yaw : %.1f°", finalYaw));
+        }
+
+        // 5. FINAL RESULT / DELTA
         if (delta != null) {
-            lines.add(String.format(Locale.US,
-                    "Δ Delta : %+.1f°  (tol ±%.0f°)", delta, DEFAULT_TOLERANCE));
-            lines.add("Result  : " + (Math.abs(delta) <= DEFAULT_TOLERANCE
-                    ? "✅ SAME POSITION" : "❌ MOVED"));
+            lines.add("──────────────────────────");
+            lines.add(String.format(Locale.US, "Δ Delta : %+.1f°  (tol ±%.0f°)", delta, DEFAULT_TOLERANCE));
+            lines.add("Result  : " + (Math.abs(delta) <= DEFAULT_TOLERANCE ? "✅ SAME POSITION" : "❌ MOVED"));
         }
+
+        // Push to UI
         String text = String.join("\n", lines);
         runOnUiThread(() -> infoText.setText(text));
     }
@@ -1105,9 +1280,6 @@ public class MainActivity extends AppCompatActivity {
         return (diff / 86_400_000) + "d ago";
     }
 
-    /**
-     * Mirrors iOS rec.appVersion shown in history dialog
-     */
     private String getAppVersion() {
         try {
             return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
@@ -1120,12 +1292,9 @@ public class MainActivity extends AppCompatActivity {
         float[] m = new float[16];
         frame.getCamera().getPose().toMatrix(m, 0);
 
-        float fx = -m[8];
-        float fz = -m[10];
-
-        double yaw = Math.toDegrees(Math.atan2(fx, fz));
+        float fx = -m[8], fz = -m[10];
+        double yaw = Math.toDegrees(Math.atan2(fx, -fz));
         if (yaw < 0) yaw += 360;
-
         return yaw;
     }
 }
