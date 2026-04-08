@@ -4,6 +4,7 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.pm.PackageManager;
 import android.hardware.GeomagneticField;
+import android.hardware.SensorManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
@@ -38,6 +39,7 @@ import com.google.mlkit.vision.barcode.common.Barcode;
 import com.google.mlkit.vision.common.InputImage;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -73,6 +75,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean isCollectingMag = false;
     private double samplingOffsetAnchor = Double.NaN;
     private double lastRawMagHeading = Double.NaN;
+    private float lastHeadingErrorDegrees = Float.NaN;
     private String lastPayload;
     private QRDatabaseHelper.Registration currentRegistration;
     private boolean isSampling = false;
@@ -80,6 +83,8 @@ public class MainActivity extends AppCompatActivity {
     private final List<YawSample> sampleBuffer = new ArrayList<>();
     private long lastSampleTime = 0;
     private List<float[]> lastDetectedCorners;
+    private float[] lastAcceptedImagePoints;
+    private float[] lastAcceptedViewPoints;
     private long lastQrSeenTime = 0;
     private boolean isProcessingFrame = false;
 
@@ -140,6 +145,7 @@ public class MainActivity extends AppCompatActivity {
         magSamplesDisplay = null;
         lastSampleTime = 0;
         lastDetectedCorners = null;
+        resetTrackedQrCorners();
         lastQrSeenTime = 0;
         isProcessingFrame = false;
 
@@ -187,6 +193,7 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onDeviceOrientationChanged(DeviceOrientation orientation) {
             float headingError = orientation.getHeadingErrorDegrees();
+            lastHeadingErrorDegrees = headingError;
 
             if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
                 if (isCollectingMag) {
@@ -195,8 +202,10 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
+
             runOnUiThread(() -> {
-                lastRawMagHeading = orientation.getHeadingDegrees();
+                double rawHeading = getCameraHeadingDegrees(orientation);
+                lastRawMagHeading = rawHeading;
 
                 // Collect 40 samples strictly ON DEMAND
                 if (isCollectingMag) {
@@ -229,23 +238,21 @@ public class MainActivity extends AppCompatActivity {
                         }
                         magSamplesDisplay = uiSb.toString();
 
-                        double sumSin = 0;
-                        double sumCos = 0;
-                        for (double val : magValidationBuffer) {
-                            double rad = Math.toRadians(val);
-                            sumSin += Math.sin(rad);
-                            sumCos += Math.cos(rad);
-                        }
-
-                        samplingOffsetAnchor = Math.toDegrees(Math.atan2(sumSin / MAG_SAMPLES_REQUIRED, sumCos / MAG_SAMPLES_REQUIRED));
-                        if (samplingOffsetAnchor < 0) samplingOffsetAnchor += 360.0;
+                        List<Double> filteredMagSamples = filterCircularOutliers(magValidationBuffer);
+                        samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples);
 
                         isCollectingMag = false;
 
                         showStatus("📐 North locked. Measuring QR...");
                         dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
 
-                        log("Averaged " + MAG_SAMPLES_REQUIRED + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
+                        int rejectedSamples = magValidationBuffer.size() - filteredMagSamples.size();
+                        if (rejectedSamples > 0) {
+                            log(String.format(Locale.US,
+                                    "Filtered %d/%d magnetic outliers before averaging",
+                                    rejectedSamples, magValidationBuffer.size()));
+                        }
+                        log("Averaged " + filteredMagSamples.size() + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
                     }
                 }
             });
@@ -406,6 +413,7 @@ public class MainActivity extends AppCompatActivity {
     private void resetAlignment() {
         samplingOffsetAnchor = Double.NaN;
         lastRawMagHeading = Double.NaN;
+        lastHeadingErrorDegrees = Float.NaN;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -471,6 +479,7 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     private void onQRPayloadDetected(String payload) {
         if (payload.equals(lastPayload)) return;
+        resetTrackedQrCorners();
         lastPayload = payload;
         currentRegistration = null;
 
@@ -692,7 +701,7 @@ public class MainActivity extends AppCompatActivity {
         Log.i("SAMPLES", sb.toString());
     }
 
-    private void updateFullSampleListUI(double latestNorth, double latestWeight) {
+    private void updateFullSampleListUI() {
         StringBuilder sb = new StringBuilder();
         sb.append("🛰️ SAMPLING NORTH BEARING\n");
         sb.append("──────────────────────────\n");
@@ -758,7 +767,7 @@ public class MainActivity extends AppCompatActivity {
 
         sampleBuffer.add(new YawSample(result.yaw, sampleNorth, result.confidence));
         logSampleBuffer();
-        updateFullSampleListUI(sampleNorth, result.confidence);
+        updateFullSampleListUI();
         log("method=" + result.method);
 
         log(String.format(Locale.US, "  Sample %d: yaw=%.1f° conf=%.2f [%s]",
@@ -796,6 +805,55 @@ public class MainActivity extends AppCompatActivity {
         double mean = Math.toDegrees(Math.atan2(sumSin / totalWeight, sumCos / totalWeight));
         if (mean < 0) mean += 360.0;
         return mean;
+    }
+
+    private double circularMeanDegrees(List<Double> samples) {
+        if (samples.isEmpty()) return 0.0;
+
+        double sumSin = 0.0;
+        double sumCos = 0.0;
+        for (double value : samples) {
+            double rad = Math.toRadians(value);
+            sumSin += Math.sin(rad);
+            sumCos += Math.cos(rad);
+        }
+
+        double mean = Math.toDegrees(Math.atan2(sumSin / samples.size(), sumCos / samples.size()));
+        if (mean < 0) mean += 360.0;
+        return mean;
+    }
+
+    private List<Double> filterCircularOutliers(List<Double> samples) {
+        if (samples.size() < 5) {
+            return new ArrayList<>(samples);
+        }
+
+        double center = circularMeanDegrees(samples);
+        List<Double> deviations = new ArrayList<>(samples.size());
+        for (double sample : samples) {
+            deviations.add(Math.abs(angleDifference(center, sample)));
+        }
+        Collections.sort(deviations);
+
+        double medianDeviation = deviations.get(deviations.size() / 2);
+        double threshold = Math.max(3.0, Math.min(20.0, medianDeviation * 3.0 + 2.0));
+
+        List<Double> filtered = new ArrayList<>(samples.size());
+        for (double sample : samples) {
+            if (Math.abs(angleDifference(center, sample)) <= threshold) {
+                filtered.add(sample);
+            }
+        }
+
+        int minimumKept = Math.max(8, samples.size() / 2);
+        if (filtered.size() < minimumKept) {
+            log(String.format(Locale.US,
+                    "Mag outlier filter kept only %d/%d samples; falling back to all samples",
+                    filtered.size(), samples.size()));
+            return new ArrayList<>(samples);
+        }
+
+        return filtered;
     }
 
     private void commitReading(double rawYaw) {
@@ -903,25 +961,12 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Core: Compute QR World Yaw via ARCore
     // ─────────────────────────────────────────────────────────────────────────
-    private QRMeasurement computeQRYawFromTopEdge(Frame frame, float[] imagePoints) {
-        com.google.ar.core.Camera camera = frame.getCamera();
-        if (camera.getTrackingState() != TrackingState.TRACKING) return null;
-
-        float[] camPose = new float[16];
-        camera.getPose().toMatrix(camPose, 0);
-
-        return computeQRYawFromTopEdgeWithPose(imagePoints, camPose, camera.getImageIntrinsics());
-    }
-
-    // Notice: The 'Frame frame' parameter is completely removed.
-    // We only need the raw math arrays.
     private QRMeasurement computeQRYawFromTopEdgeWithPose(float[] imagePoints, float[] camPose,
                                                           CameraIntrinsics intr) {
         float[] focal = intr.getFocalLength();
         float[] pp = intr.getPrincipalPoint();
 
         float fx = focal[0], fy = focal[1], cx = pp[0], cy = pp[1];
-        float[] camOrigin = {camPose[12], camPose[13], camPose[14]};
 
         float[][] imgPts = {
                 {imagePoints[0], imagePoints[1]},
@@ -929,14 +974,6 @@ public class MainActivity extends AppCompatActivity {
                 {imagePoints[4], imagePoints[5]},
                 {imagePoints[6], imagePoints[7]}
         };
-
-        float[][] rays = new float[4][];
-        for (int i = 0; i < 4; i++) {
-            float xn = (imgPts[i][0] - cx) / fx;
-            float yn = (imgPts[i][1] - cy) / fy;
-            float[] camRay = vec3Normalize(new float[]{xn, -yn, -1f});
-            rays[i] = vec3Normalize(rotateCamToWorld(camRay, camPose));
-        }
 
         String method = "vanishing-point";
 
@@ -948,15 +985,7 @@ public class MainActivity extends AppCompatActivity {
             return null;
         }
 
-        // 2. Estimate a generic plane point right in front of the camera
-        float[] camFwd2 = {-camPose[8], -camPose[9], -camPose[10]};
-        float[] planePoint = new float[]{
-                camOrigin[0] + camFwd2[0] * 0.5f,
-                camOrigin[1] + camFwd2[1] * 0.5f,
-                camOrigin[2] + camFwd2[2] * 0.5f
-        };
-
-        // 3. Ensure Normal is facing the camera
+        // 2. Ensure Normal is facing the camera
         float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
         float dotNormalCamFwd = vec3Dot(planeNormal, camFwd);
         if (dotNormalCamFwd < 0) {
@@ -965,29 +994,17 @@ public class MainActivity extends AppCompatActivity {
                     dotNormalCamFwd, planeNormal[0], planeNormal[1], planeNormal[2]));
         }
 
-        // 4. Intersect Rays to find 3D Top-Left and Bottom-Left corners
-        float[] tl3D = intersectPlane(camOrigin, rays[0], planePoint, planeNormal);
-        float[] bl3D = intersectPlane(camOrigin, rays[3], planePoint, planeNormal);
-
-        if (tl3D == null || bl3D == null) {
-            log("[yawCalc] Ray-plane intersection failed");
-            return null;
-        }
-
-        // 5. FORCE "FLOOR" LOGIC (This fixes the 90-degree flip bug!)
-        // We ignore the noisy normal vector length and strictly measure the ink rotation.
-        float[] qrUp = vec3Normalize(new float[]{tl3D[0] - bl3D[0], tl3D[1] - bl3D[1], tl3D[2] - bl3D[2]});
-        double hx = qrUp[0];
-        double hz = qrUp[2];
-
+        // 3. Wall-specific yaw: use the face normal projected onto the horizontal plane.
+        double hx = planeNormal[0];
+        double hz = planeNormal[2];
         if (Math.hypot(hx, hz) < 0.15) {
-            log("[yawCalc] Floor case: QR up-vector too vertical");
+            log("[yawCalc] Wall case rejected: plane normal is too horizontal");
             return null;
         }
 
-        String yawSource = "FLOOR (QR up-vector)";
+        String yawSource = "WALL (plane normal)";
 
-        // 6. Final Angle Calculation
+        // 4. Final Angle Calculation
         double yaw = Math.toDegrees(Math.atan2(hx, -hz));
         if (yaw < 0) yaw += 360;
 
@@ -997,27 +1014,6 @@ public class MainActivity extends AppCompatActivity {
         log(String.format(Locale.US, "[yawCalc] RESULT: rawYaw=%.1f° conf=%.2f method=%s src=%s", yaw, confidence, method, yawSource));
 
         return new QRMeasurement(yaw, confidence, method);
-    }
-
-    private float[] intersectPlane(float[] camOrigin, float[] rayDir,
-                                   float[] planePoint, float[] planeNormal) {
-        float denom = vec3Dot(rayDir, planeNormal);
-        if (Math.abs(denom) < 1e-5) return null;
-
-        float[] diff = {
-                planePoint[0] - camOrigin[0],
-                planePoint[1] - camOrigin[1],
-                planePoint[2] - camOrigin[2]
-        };
-
-        float t = vec3Dot(diff, planeNormal) / denom;
-        if (t <= 0) return null;
-
-        return new float[]{
-                camOrigin[0] + rayDir[0] * t,
-                camOrigin[1] + rayDir[1] * t,
-                camOrigin[2] + rayDir[2] * t
-        };
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1059,11 +1055,6 @@ public class MainActivity extends AppCompatActivity {
             float[] normalCam = vec3Normalize(vec3Cross(rayX, rayY));
             if (normalCam[2] < 0) normalCam = vec3Scale(normalCam, -1f);
 
-            float displayX = normalCam[1];
-            float displayY = -normalCam[0];
-            float displayZ = normalCam[2];
-            float[] normalCamDisplay = {displayX, displayY, displayZ};
-
             float[] normalWorld = rotateCamToWorld(normalCam, camTransform);
 
             Log.d(TAG, String.format(Locale.US,
@@ -1093,6 +1084,79 @@ public class MainActivity extends AppCompatActivity {
         while (diff > 180) diff -= 360;
         while (diff < -180) diff += 360;
         return diff;
+    }
+
+    private List<float[]> toCornerList(float[] points) {
+        List<float[]> corners = new ArrayList<>(4);
+        for (int i = 0; i < 4; i++) {
+            corners.add(new float[]{points[i * 2], points[i * 2 + 1]});
+        }
+        return corners;
+    }
+
+    private void resetTrackedQrCorners() {
+        lastAcceptedImagePoints = null;
+        lastAcceptedViewPoints = null;
+    }
+
+    private float[] copyPointPairs(float[] points) {
+        float[] copy = new float[points.length];
+        System.arraycopy(points, 0, copy, 0, points.length);
+        return copy;
+    }
+
+    private float[] rotatePointPairs(float[] points, int offset) {
+        int pairCount = points.length / 2;
+        float[] rotated = new float[points.length];
+        for (int i = 0; i < pairCount; i++) {
+            int srcIndex = ((i + offset) % pairCount) * 2;
+            rotated[i * 2] = points[srcIndex];
+            rotated[i * 2 + 1] = points[srcIndex + 1];
+        }
+        return rotated;
+    }
+
+    private double scoreCornerRotation(float[] candidateViewPoints, float[] referenceViewPoints) {
+        double score = 0.0;
+        for (int i = 0; i < candidateViewPoints.length; i += 2) {
+            double dx = candidateViewPoints[i] - referenceViewPoints[i];
+            double dy = candidateViewPoints[i + 1] - referenceViewPoints[i + 1];
+            score += (dx * dx) + (dy * dy);
+        }
+        return score;
+    }
+
+    private float[][] stabilizeCornerOrder(float[] imagePoints, float[] viewPoints) {
+        if (lastAcceptedViewPoints == null || lastAcceptedImagePoints == null) {
+            lastAcceptedImagePoints = copyPointPairs(imagePoints);
+            lastAcceptedViewPoints = copyPointPairs(viewPoints);
+            log("[QR] corner order seeded from detector");
+            return new float[][]{lastAcceptedImagePoints, lastAcceptedViewPoints};
+        }
+
+        double bestScore = Double.POSITIVE_INFINITY;
+        int bestRotation = 0;
+        float[] bestImagePoints = null;
+        float[] bestViewPoints = null;
+
+        for (int rotation = 0; rotation < 4; rotation++) {
+            float[] rotatedImagePoints = rotatePointPairs(imagePoints, rotation);
+            float[] rotatedViewPoints = rotatePointPairs(viewPoints, rotation);
+            double score = scoreCornerRotation(rotatedViewPoints, lastAcceptedViewPoints);
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestRotation = rotation;
+                bestImagePoints = rotatedImagePoints;
+                bestViewPoints = rotatedViewPoints;
+            }
+        }
+
+        lastAcceptedImagePoints = bestImagePoints;
+        lastAcceptedViewPoints = bestViewPoints;
+        log(String.format(Locale.US, "[QR] stabilized corner rotation=%d score=%.1f",
+                bestRotation, bestScore));
+        return new float[][]{bestImagePoints, bestViewPoints};
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1139,6 +1203,7 @@ public class MainActivity extends AppCompatActivity {
                                 runOnUiThread(() -> {
                                     overlayView.setCorners(null);
                                     lastDetectedCorners = null;
+                                    resetTrackedQrCorners();
                                     if (lastPayload == null) showStatus("Scan a QR code to begin");
                                     if (isSampling) {
                                         isSampling = false;
@@ -1155,6 +1220,9 @@ public class MainActivity extends AppCompatActivity {
 
                         lastQrSeenTime = System.currentTimeMillis();
                         String payload = qr.getRawValue();
+                        if (lastPayload != null && !payload.equals(lastPayload)) {
+                            resetTrackedQrCorners();
+                        }
 
                         android.graphics.Point[] pts = qr.getCornerPoints();
                         if (pts == null || pts.length != 4) return;
@@ -1175,10 +1243,10 @@ public class MainActivity extends AppCompatActivity {
                             return;
                         }
 
-                        List<float[]> cornersList = new ArrayList<>();
-                        for (int i = 0; i < 4; i++) {
-                            cornersList.add(new float[]{viewPoints[i * 2], viewPoints[i * 2 + 1]});
-                        }
+                        float[][] stabilizedPoints = stabilizeCornerOrder(imagePoints, viewPoints);
+                        float[] stabilizedImagePoints = stabilizedPoints[0];
+                        float[] stabilizedViewPoints = stabilizedPoints[1];
+                        List<float[]> cornersList = toCornerList(stabilizedViewPoints);
 
                         runOnUiThread(() -> {
                             lastDetectedCorners = cornersList;
@@ -1186,7 +1254,7 @@ public class MainActivity extends AppCompatActivity {
                             onQRPayloadDetected(payload);
 
                             if (isSampling && !isCollectingMag) {
-                                collectSampleWithPose(imagePoints, capturedPose, capturedIntrinsics, capturedFrame);
+                                collectSampleWithPose(stabilizedImagePoints, capturedPose, capturedIntrinsics, capturedFrame);
                             }
                         });
                     })
@@ -1296,5 +1364,28 @@ public class MainActivity extends AppCompatActivity {
         double yaw = Math.toDegrees(Math.atan2(fx, -fz));
         if (yaw < 0) yaw += 360;
         return yaw;
+    }
+
+    private double getCameraHeadingDegrees(DeviceOrientation orientation) {
+        float[] attitude = orientation.getAttitude();
+        if (attitude == null || attitude.length < 4) {
+            return orientation.getHeadingDegrees();
+        }
+
+        float[] rotationMatrix = new float[9];
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, attitude);
+
+        // Android device axes: +X right, +Y up, +Z out of the screen.
+        // The rear camera looks along -Z in device coordinates.
+        float east = -rotationMatrix[2];
+        float north = -rotationMatrix[5];
+
+        if (Math.hypot(east, north) < 1e-5) {
+            return orientation.getHeadingDegrees();
+        }
+
+        double heading = Math.toDegrees(Math.atan2(east, north));
+        if (heading < 0) heading += 360.0;
+        return heading;
     }
 }
