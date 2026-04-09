@@ -5,6 +5,8 @@ import android.annotation.SuppressLint;
 import android.content.pm.PackageManager;
 import android.hardware.GeomagneticField;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Button;
@@ -56,6 +58,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUIRED_SAMPLES = 8;
     private static final double MIN_SAMPLE_WEIGHT = 0.15;
     private static final double DEFAULT_TOLERANCE = 15.0;
+    private static final double PITCH_TOLERANCE = 20.0;
     private static final float HEADING_ERROR_GATE = 90.0f;
     private static final int MAG_SAMPLES_REQUIRED = 40;
     private static final long MAX_SAMPLE_GAP_MS = 400;
@@ -88,6 +91,11 @@ public class MainActivity extends AppCompatActivity {
     private long lastQrSeenTime = 0;
     private boolean isProcessingFrame = false;
 
+    // ── Attitude (ENU) for floor QR ──
+    private final float[] lastAttitudeRotMat = new float[9]; // device→ENU, row-major
+    private boolean attitudeValid = false;
+    private int sensorOrientation = 90; // default, read at startup
+
     // ── Services ──
     private FusedOrientationProviderClient fusedOrientationClient;
     private FusedLocationProviderClient locationClient;
@@ -106,11 +114,13 @@ public class MainActivity extends AppCompatActivity {
     // ── Inner Data Classes ──
     private static class YawSample {
         final double yaw;
+        final double pitch;    // degrees: 0=wall, +90=floor
         final double northYaw;
         final double weight;
 
-        YawSample(double yaw, double northYaw, double weight) {
+        YawSample(double yaw, double pitch, double northYaw, double weight) {
             this.yaw = yaw;
+            this.pitch = pitch;
             this.northYaw = northYaw;
             this.weight = weight;
         }
@@ -118,11 +128,13 @@ public class MainActivity extends AppCompatActivity {
 
     private static class QRMeasurement {
         final double yaw;
+        final double pitch;    // degrees: 0=wall, +90=floor
         final double confidence;
         final String method;
 
-        QRMeasurement(double yaw, double confidence, String method) {
+        QRMeasurement(double yaw, double pitch, double confidence, String method) {
             this.yaw = yaw;
+            this.pitch = pitch;
             this.confidence = confidence;
             this.method = method;
         }
@@ -202,6 +214,12 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
+            // Store full attitude rotation matrix for floor QR ENU projection
+            float[] attitude = orientation.getAttitude();
+            if (attitude != null && attitude.length >= 4) {
+                SensorManager.getRotationMatrixFromVector(lastAttitudeRotMat, attitude);
+                attitudeValid = true;
+            }
 
             runOnUiThread(() -> {
                 double rawHeading = getCameraHeadingDegrees(orientation);
@@ -295,6 +313,30 @@ public class MainActivity extends AppCompatActivity {
         };
     }
 
+    /**
+     * Transform a camera-space vector to ENU (East-North-Up) world space using
+     * the device attitude rotation matrix and sensor orientation.
+     * Camera space: X=right-in-image, Y=up-in-image, Z=backward.
+     * Result: [East, North, Up].
+     */
+    private float[] rotateCamToENU(float[] camVec, float[] R, int sensorOri) {
+        float cx = camVec[0], cy = camVec[1], cz = camVec[2];
+        // Camera → Device rotation based on sensor orientation
+        float dx, dy, dz;
+        switch (sensorOri) {
+            case 90:  dx = -cy; dy = cx;  dz = cz; break;
+            case 270: dx = cy;  dy = -cx; dz = cz; break;
+            case 180: dx = -cx; dy = -cy; dz = cz; break;
+            default:  dx = cx;  dy = cy;  dz = cz; break; // 0°
+        }
+        // Device → ENU (R is row-major 3×3 from SensorManager.getRotationMatrixFromVector)
+        return new float[]{
+                R[0] * dx + R[1] * dy + R[2] * dz,  // East
+                R[3] * dx + R[4] * dy + R[5] * dz,  // North
+                R[6] * dx + R[7] * dy + R[8] * dz   // Up
+        };
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle & Permissions
     // ─────────────────────────────────────────────────────────────────────────
@@ -335,6 +377,25 @@ public class MainActivity extends AppCompatActivity {
 
         fusedOrientationClient = LocationServices.getFusedOrientationProviderClient(this);
         locationClient = LocationServices.getFusedLocationProviderClient(this);
+
+        // Read camera sensor orientation for attitude→ENU floor yaw
+        try {
+            CameraManager cm = (CameraManager) getSystemService(CAMERA_SERVICE);
+            String[] ids = cm.getCameraIdList();
+            for (String id : ids) {
+                Integer facing = cm.getCameraCharacteristics(id)
+                        .get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    Integer ori = cm.getCameraCharacteristics(id)
+                            .get(CameraCharacteristics.SENSOR_ORIENTATION);
+                    if (ori != null) sensorOrientation = ori;
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            log("Could not read sensor orientation, defaulting to 90: " + e.getMessage());
+        }
+        log("Sensor orientation: " + sensorOrientation + "°");
 
         arSceneView.setSessionConfiguration((session, config) -> {
             config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL);
@@ -490,7 +551,7 @@ public class MainActivity extends AppCompatActivity {
             setMode(ScanMode.VALIDATE);
             dbBadge.setText("📦 Loaded from DB  (registered " + relativeTime(record.registeredAt) + ")");
             showStatus("QR Detected ✓  —  Registration found in DB!\nPress VALIDATE to check orientation.");
-            updateInfoLabel(null, null, null, record, null, InfoSource.DATABASE);
+            updateInfoLabel(null, null, null, record, null, null, InfoSource.DATABASE);
             log("DB hit → payload=" + payload + " yaw=" + record.yaw + "°");
         } else {
             setMode(ScanMode.REGISTER);
@@ -585,7 +646,8 @@ public class MainActivity extends AppCompatActivity {
 
         if (reg != null) {
             msg.append(String.format(Locale.US, "Yaw      : %.1f°\n", reg.yaw));
-            msg.append(String.format(Locale.US, "Tolerance: ±%.0f°\n", reg.tolerance));
+            msg.append(String.format(Locale.US, "Pitch    : %.1f° (%s)\n", reg.pitchDegrees, pitchLabel(reg.pitchDegrees)));
+            msg.append(String.format(Locale.US, "Tolerance: yaw ±%.0f°  pitch ±%.0f°\n", reg.tolerance, PITCH_TOLERANCE));
             msg.append("Saved    : ").append(relativeTime(reg.registeredAt)).append("\n");
             msg.append("Device   : ").append(android.os.Build.MODEL).append("\n");
             msg.append("App      : ").append(getAppVersion()).append("\n");
@@ -599,8 +661,8 @@ public class MainActivity extends AppCompatActivity {
         } else {
             for (QRDatabaseHelper.Validation v : validations) {
                 String icon = v.withinTolerance ? "✅" : "❌";
-                msg.append(String.format(Locale.US, "%s %s   Δ%+.1f°\n",
-                        icon, relativeTime(v.validatedAt), v.delta));
+                msg.append(String.format(Locale.US, "%s %s   Δyaw%+.1f° Δpitch%+.1f°\n",
+                        icon, relativeTime(v.validatedAt), v.delta, v.pitchDelta));
             }
         }
 
@@ -671,11 +733,11 @@ public class MainActivity extends AppCompatActivity {
         }, 1500);
     }
 
-    private void collectSampleWithPose(float[] imagePoints, float[] camPose,
-                                       CameraIntrinsics intrinsics, Frame frame) {
+    private void collectSampleWithPose(float[] imagePoints, float[] rawImagePoints,
+                                       float[] camPose, CameraIntrinsics intrinsics, Frame frame) {
         log("[collectSampleWithPose] Using pre-captured pose. camOrigin=("
                 + String.format(Locale.US, "%.3f, %.3f, %.3f", camPose[12], camPose[13], camPose[14]) + ")");
-        QRMeasurement result = computeQRYawFromTopEdgeWithPose(imagePoints, camPose, intrinsics);
+        QRMeasurement result = computeQRYawFromTopEdgeWithPose(imagePoints, rawImagePoints, camPose, intrinsics);
 
         if (result == null) {
             log("[collectSampleWithPose] computeQRYaw returned null — skipping");
@@ -690,13 +752,13 @@ public class MainActivity extends AppCompatActivity {
     private void logSampleBuffer() {
         StringBuilder sb = new StringBuilder();
         sb.append("\n=== QR NORTH SAMPLES [").append(sampleBuffer.size()).append("/").append(REQUIRED_SAMPLES).append("] ===\n");
-        sb.append(String.format(Locale.US, "%-10s | %-10s | %-8s | %-8s\n", "ID", "NORTH", "RAW AR", "WEIGHT"));
-        sb.append("--------------------------------------------------\n");
+        sb.append(String.format(Locale.US, "%-10s | %-10s | %-8s | %-8s | %-8s\n", "ID", "NORTH", "RAW AR", "PITCH", "WEIGHT"));
+        sb.append("--------------------------------------------------------------\n");
 
         for (int i = 0; i < sampleBuffer.size(); i++) {
             YawSample s = sampleBuffer.get(i);
-            sb.append(String.format(Locale.US, "#%-9d | %-8.2f°  | %-8.2f° | %-6.2f\n",
-                    i + 1, s.northYaw, s.yaw, s.weight));
+            sb.append(String.format(Locale.US, "#%-9d | %-8.2f°  | %-8.2f° | %-8.1f° | %-6.2f\n",
+                    i + 1, s.northYaw, s.yaw, s.pitch, s.weight));
         }
         Log.i("SAMPLES", sb.toString());
     }
@@ -709,8 +771,8 @@ public class MainActivity extends AppCompatActivity {
         for (int i = 0; i < sampleBuffer.size(); i++) {
             YawSample s = sampleBuffer.get(i);
             String indicator = (i == sampleBuffer.size() - 1) ? "▶ " : "  ";
-            sb.append(String.format(Locale.US, "%sSample #%d: %.2f°  (w: %.2f)\n",
-                    indicator, i + 1, s.northYaw, s.weight));
+            sb.append(String.format(Locale.US, "%sSample #%d: %.2f° pitch:%.1f° (w: %.2f)\n",
+                    indicator, i + 1, s.northYaw, s.pitch, s.weight));
         }
 
         int progress = sampleBuffer.size();
@@ -729,8 +791,14 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        double sampleNorth = (result.yaw + samplingOffsetAnchor) % 360.0;
-        if (sampleNorth < 0) sampleNorth += 360.0;
+        // Attitude-based floor yaw is already in ENU (global) space — skip magnetic offset
+        double sampleNorth;
+        if ("attitude-VP".equals(result.method)) {
+            sampleNorth = result.yaw; // Already global ENU-based
+        } else {
+            sampleNorth = (result.yaw + samplingOffsetAnchor) % 360.0;
+            if (sampleNorth < 0) sampleNorth += 360.0;
+        }
 
         // ── Outlier check BEFORE adding to buffer ──
         if (!sampleBuffer.isEmpty()) {
@@ -765,7 +833,7 @@ public class MainActivity extends AppCompatActivity {
         }
         lastSampleTime = now;
 
-        sampleBuffer.add(new YawSample(result.yaw, sampleNorth, result.confidence));
+        sampleBuffer.add(new YawSample(result.yaw, result.pitch, sampleNorth, result.confidence));
         logSampleBuffer();
         updateFullSampleListUI();
         log("method=" + result.method);
@@ -787,9 +855,11 @@ public class MainActivity extends AppCompatActivity {
             log(sb.toString());
 
             double finalYaw = circularWeightedMean(sampleBuffer);
-            log(String.format(Locale.US, "Sampling complete. Averaged yaw = %.2f° from %d samples", finalYaw, sampleBuffer.size()));
+            double finalPitch = weightedPitchMean(sampleBuffer);
+            log(String.format(Locale.US, "Sampling complete. Averaged yaw=%.2f° pitch=%.1f° (%s) from %d samples",
+                    finalYaw, finalPitch, pitchLabel(finalPitch), sampleBuffer.size()));
             sampleBuffer.clear();
-            commitReading(finalYaw);
+            commitReading(finalYaw, finalPitch);
         }
     }
 
@@ -805,6 +875,16 @@ public class MainActivity extends AppCompatActivity {
         double mean = Math.toDegrees(Math.atan2(sumSin / totalWeight, sumCos / totalWeight));
         if (mean < 0) mean += 360.0;
         return mean;
+    }
+
+    /** Weighted arithmetic mean for pitch (no wraparound needed, range is -90 to +90). */
+    private double weightedPitchMean(List<YawSample> samples) {
+        double sum = 0, totalWeight = 0;
+        for (YawSample s : samples) {
+            sum += s.pitch * s.weight;
+            totalWeight += s.weight;
+        }
+        return totalWeight < 1e-6 ? 0 : sum / totalWeight;
     }
 
     private double circularMeanDegrees(List<Double> samples) {
@@ -856,18 +936,22 @@ public class MainActivity extends AppCompatActivity {
         return filtered;
     }
 
-    private void commitReading(double rawYaw) {
+    private void commitReading(double rawYaw, double pitch) {
         if (lastPayload == null) return;
 
         double offsetToUse = samplingOffsetAnchor;
+        boolean isFloor = Math.abs(pitch) >= 65.0;
 
         log("COMMIT READING DEBUG:");
         log(" -> Raw AR Yaw (from math): " + rawYaw + "°");
-        log(" -> Offset USED: " + offsetToUse + "°");
+        log(" -> Pitch: " + String.format(Locale.US, "%.1f° (%s)", pitch, pitchLabel(pitch)));
+        log(" -> isFloor: " + isFloor + " (attitude-VP yaw is already ENU-based)");
+        log(" -> Offset USED: " + (isFloor ? "SKIPPED (floor)" : offsetToUse + "°"));
 
         double yaw = rawYaw;
 
-        if (!Double.isNaN(offsetToUse)) {
+        // Floor QR yaw from attitude-VP is already in ENU global space — skip magnetic offset
+        if (!isFloor && !Double.isNaN(offsetToUse)) {
             yaw = (rawYaw + offsetToUse) % 360.0;
             if (yaw < 0) yaw += 360.0;
         }
@@ -886,7 +970,7 @@ public class MainActivity extends AppCompatActivity {
                     .apply();
 
             Long dbId = QRDatabaseHelper.getInstance(this).saveRegistration(
-                    lastPayload, yaw, normalX, 0.0, normalZ, DEFAULT_TOLERANCE);
+                    lastPayload, yaw, pitch, normalX, 0.0, normalZ, DEFAULT_TOLERANCE);
 
             if (dbId == null) {
                 showStatus("⚠️ Database save failed.");
@@ -897,6 +981,7 @@ public class MainActivity extends AppCompatActivity {
             reg.id = dbId;
             reg.payload = lastPayload;
             reg.yaw = yaw;
+            reg.pitchDegrees = pitch;
             reg.normalX = normalX;
             reg.normalY = 0.0;
             reg.normalZ = normalZ;
@@ -908,12 +993,13 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 setMode(ScanMode.VALIDATE);
                 dbBadge.setText("💾 Saved to DB  (id=" + dbId + ")");
-                showStatus(String.format(Locale.US, "✅ Registered & Saved!\nYaw = %.1f°  |  id=%d", finalYaw, dbId));
-                updateInfoLabel(rawYaw, finalYaw, offsetToUse, reg, null, InfoSource.FRESH_REGISTER);
+                showStatus(String.format(Locale.US, "✅ Registered & Saved!\nYaw = %.1f°  Pitch = %.1f° (%s)\nid=%d",
+                        finalYaw, pitch, pitchLabel(pitch), dbId));
+                updateInfoLabel(rawYaw, finalYaw, offsetToUse, reg, null, null, InfoSource.FRESH_REGISTER);
             });
 
-            log(String.format(Locale.US, "Registered → payload=%s…  yaw=%.1f°  dbId=%d",
-                    lastPayload.substring(0, Math.min(20, lastPayload.length())), yaw, dbId));
+            log(String.format(Locale.US, "Registered → payload=%s…  yaw=%.1f°  pitch=%.1f° (%s)  dbId=%d",
+                    lastPayload.substring(0, Math.min(20, lastPayload.length())), yaw, pitch, pitchLabel(pitch), dbId));
 
         } else {
             QRDatabaseHelper.Registration record = QRDatabaseHelper.getInstance(this).fetchRegistration(lastPayload);
@@ -933,36 +1019,68 @@ public class MainActivity extends AppCompatActivity {
                         regOffset, offsetToUse, offsetDelta, offsetDrifted));
             }
 
-            double delta = angleDifference(record.yaw, yaw);
-            log(String.format(Locale.US, "[VALIDATE] registeredYaw=%.1f° currentYaw=%.1f° delta=%+.1f° tolerance=±%.0f° result=%s",
-                    record.yaw, yaw, delta, DEFAULT_TOLERANCE, (Math.abs(delta) <= DEFAULT_TOLERANCE) ? "PASS" : "FAIL"));
-            boolean within = Math.abs(delta) <= DEFAULT_TOLERANCE;
+            // Yaw validation
+            double yawDelta = angleDifference(record.yaw, yaw);
+            boolean yawOK = Math.abs(yawDelta) <= DEFAULT_TOLERANCE;
+
+            // Pitch validation
+            double pitchDelta = pitch - record.pitchDegrees;
+            boolean pitchOK = Math.abs(pitchDelta) <= PITCH_TOLERANCE;
+
+            // Both must pass
+            boolean overallOK = yawOK && pitchOK;
+
+            log(String.format(Locale.US,
+                    "[VALIDATE] yaw: reg=%.1f° cur=%.1f° Δ=%+.1f° (±%.0f°) %s | pitch: reg=%.1f° cur=%.1f° Δ=%+.1f° (±%.0f°) %s | overall=%s",
+                    record.yaw, yaw, yawDelta, DEFAULT_TOLERANCE, yawOK ? "PASS" : "FAIL",
+                    record.pitchDegrees, pitch, pitchDelta, PITCH_TOLERANCE, pitchOK ? "PASS" : "FAIL",
+                    overallOK ? "PASS" : "FAIL"));
 
             QRDatabaseHelper.getInstance(this).saveValidation(
-                    record.id, lastPayload, yaw, record.yaw, delta, within, DEFAULT_TOLERANCE);
+                    record.id, lastPayload, yaw, record.yaw, yawDelta, overallOK, DEFAULT_TOLERANCE,
+                    pitch, record.pitchDegrees, pitchDelta, pitchOK);
 
             double finalYaw1 = yaw;
 
             runOnUiThread(() -> {
-                String icon = within ? "✅" : "❌";
-                String moved = within ? "NOT moved" : "MOVED";
-                showStatus(String.format(Locale.US, "%s QR has %s\nΔYaw = %+.1f°   (±%.0f° tolerance)",
-                        icon, moved, delta, DEFAULT_TOLERANCE));
+                String yawIcon = yawOK ? "✅" : "❌";
+                String pitchIcon = pitchOK ? "✅" : "❌";
+
+                String statusMsg;
+                if (overallOK) {
+                    statusMsg = "✅ QR has NOT moved";
+                } else if (!pitchOK && yawOK) {
+                    statusMsg = "❌ SURFACE CHANGED (" + pitchLabel(record.pitchDegrees) + " → " + pitchLabel(pitch) + "?)";
+                } else if (!yawOK && pitchOK) {
+                    statusMsg = "❌ DIRECTION CHANGED";
+                } else {
+                    statusMsg = "❌ QR has MOVED (yaw + surface)";
+                }
+
+                showStatus(String.format(Locale.US,
+                        "%s\n\n%s Yaw  Δ = %+.1f°  (±%.0f°)\n%s Pitch Δ = %+.1f°  (±%.0f°)\n[%s → %s]",
+                        statusMsg,
+                        yawIcon, yawDelta, DEFAULT_TOLERANCE,
+                        pitchIcon, pitchDelta, PITCH_TOLERANCE,
+                        pitchLabel(record.pitchDegrees), pitchLabel(pitch)));
                 dbBadge.setText("📝 Validation logged to DB");
-                updateInfoLabel(rawYaw, finalYaw1, offsetToUse, record, delta, InfoSource.DATABASE);
+                updateInfoLabel(rawYaw, finalYaw1, offsetToUse, record, yawDelta, pitchDelta, InfoSource.DATABASE);
             });
 
-            log(String.format(Locale.US, "Validate → payload=%s…\n           current=%.1f°\n           registered=%.1f°\n           Δ=%+.1f°\n           yawOK=%b",
+            log(String.format(Locale.US,
+                    "Validate → payload=%s…\n           currentYaw=%.1f°  registeredYaw=%.1f°  Δyaw=%+.1f°  yawOK=%b\n           currentPitch=%.1f°  registeredPitch=%.1f°  Δpitch=%+.1f°  pitchOK=%b\n           overall=%b",
                     lastPayload.substring(0, Math.min(20, lastPayload.length())),
-                    yaw, record.yaw, delta, within));
+                    yaw, record.yaw, yawDelta, yawOK,
+                    pitch, record.pitchDegrees, pitchDelta, pitchOK,
+                    overallOK));
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Core: Compute QR World Yaw via ARCore
     // ─────────────────────────────────────────────────────────────────────────
-    private QRMeasurement computeQRYawFromTopEdgeWithPose(float[] imagePoints, float[] camPose,
-                                                          CameraIntrinsics intr) {
+    private QRMeasurement computeQRYawFromTopEdgeWithPose(float[] imagePoints, float[] rawImagePoints,
+                                                          float[] camPose, CameraIntrinsics intr) {
         float[] focal = intr.getFocalLength();
         float[] pp = intr.getPrincipalPoint();
 
@@ -994,26 +1112,52 @@ public class MainActivity extends AppCompatActivity {
                     dotNormalCamFwd, planeNormal[0], planeNormal[1], planeNormal[2]));
         }
 
-        // 3. Wall-specific yaw: use the face normal projected onto the horizontal plane.
+        // 3. Compute pitch from normal's vertical component
+        //    normal.y ≈ 0 → wall, ≈ +1 → floor
+        double clampedY = Math.max(-1.0, Math.min(1.0, (double) planeNormal[1]));
+        double pitch = Math.toDegrees(Math.asin(clampedY));
+
+        // 4. Branch on wall vs floor based on horizontal magnitude of normal
         double hx = planeNormal[0];
         double hz = planeNormal[2];
-        if (Math.hypot(hx, hz) < 0.15) {
-            log("[yawCalc] Wall case rejected: plane normal is too horizontal");
-            return null;
+        double hMag = Math.hypot(hx, hz);
+
+        double yaw;
+        double confidence;
+        String yawSource;
+
+        if (hMag > 0.15) {
+            // ── WALL CASE: unchanged — use face normal projected onto horizontal plane ──
+            yawSource = "WALL (plane normal)";
+            yaw = Math.toDegrees(Math.atan2(hx, -hz));
+            if (yaw < 0) yaw += 360;
+            confidence = 0.8;
+        } else {
+            // ── FLOOR CASE: use attitude-based VP for position-independent yaw ──
+            Double floorYaw = computeFloorYawViaAttitude(imagePoints, intr.getFocalLength(), intr.getPrincipalPoint());
+            if (floorYaw != null) {
+                yawSource = "FLOOR (attitude-VP)";
+                yaw = floorYaw;
+                confidence = 0.6;
+            } else {
+                // Fallback to ray-plane method if attitude is unavailable
+                log("[yawCalc] Attitude floor yaw failed, falling back to ray-plane");
+                yawSource = "FLOOR (ray-plane fallback)";
+                floorYaw = computeFloorYaw(rawImagePoints, planeNormal, camPose, intr);
+                if (floorYaw == null) {
+                    log("[yawCalc] Floor yaw computation failed");
+                    return null;
+                }
+                yaw = floorYaw;
+                confidence = 0.5;
+            }
         }
 
-        String yawSource = "WALL (plane normal)";
+        log(String.format(Locale.US, "[yawCalc] RESULT: rawYaw=%.1f° pitch=%.1f° (%s) conf=%.2f method=%s src=%s",
+                yaw, pitch, pitchLabel(pitch), confidence, method, yawSource));
 
-        // 4. Final Angle Calculation
-        double yaw = Math.toDegrees(Math.atan2(hx, -hz));
-        if (yaw < 0) yaw += 360;
-
-        // Since we are strictly VP, we give it a solid confidence base
-        double confidence = 0.8;
-
-        log(String.format(Locale.US, "[yawCalc] RESULT: rawYaw=%.1f° conf=%.2f method=%s src=%s", yaw, confidence, method, yawSource));
-
-        return new QRMeasurement(yaw, confidence, method);
+        String resultMethod = yawSource.startsWith("FLOOR (attitude") ? "attitude-VP" : method;
+        return new QRMeasurement(yaw, pitch, confidence, resultMethod);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1074,6 +1218,200 @@ public class MainActivity extends AppCompatActivity {
         float x = (v[0] - w * cx) / fx;
         float y = (v[1] - w * cy) / fy;
         return vec3Normalize(new float[]{x, -y, -w});
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Floor Yaw Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Cast a ray from camera through an image pixel and intersect with a world-space plane.
+     * Returns the 3D intersection point, or null if the ray is parallel / behind camera.
+     */
+    private float[] intersectRayPlane(float imgX, float imgY,
+                                      float fx, float fy, float cx, float cy,
+                                      float[] camPose, float[] camOrigin,
+                                      float[] planeNormal, float[] planePoint) {
+        // Camera-space ray: unproject pixel through intrinsics
+        float[] camRay = vec3Normalize(new float[]{
+                (imgX - cx) / fx,
+                -((imgY - cy) / fy),   // negate Y: image Y-down → camera Y-up
+                -1.0f                   // camera looks along -Z
+        });
+        // World-space ray
+        float[] worldRay = rotateCamToWorld(camRay, camPose);
+
+        float denom = vec3Dot(worldRay, planeNormal);
+        if (Math.abs(denom) < 1e-5f) return null;  // ray parallel to plane
+
+        float[] diff = {
+                planePoint[0] - camOrigin[0],
+                planePoint[1] - camOrigin[1],
+                planePoint[2] - camOrigin[2]
+        };
+        float t = vec3Dot(diff, planeNormal) / denom;
+        if (t <= 0) return null;  // intersection behind camera
+
+        return new float[]{
+                camOrigin[0] + worldRay[0] * t,
+                camOrigin[1] + worldRay[1] * t,
+                camOrigin[2] + worldRay[2] * t
+        };
+    }
+
+    /**
+     * Compute yaw for a floor QR code using the QR's printed "up" edge direction.
+     * Uses RAW (unstabilized) ML Kit corners so TL/BL identity is consistent regardless
+     * of camera viewing angle — critical for scanning floor QR codes from any direction.
+     *
+     * @param rawImagePoints RAW ML Kit corners (8 floats: TL, TR, BR, BL)
+     * @param planeNormal    world-space face normal (pointing up for floor)
+     * @param camPose        4x4 column-major camera pose matrix
+     * @param intr           camera intrinsics
+     * @return yaw in degrees [0,360), or null on failure
+     */
+    private Double computeFloorYaw(float[] rawImagePoints, float[] planeNormal,
+                                   float[] camPose, CameraIntrinsics intr) {
+        float[] focal = intr.getFocalLength();
+        float[] pp = intr.getPrincipalPoint();
+        float fx = focal[0], fy = focal[1], cx = pp[0], cy = pp[1];
+
+        // Camera origin from pose (column-major: translation at m[12], m[13], m[14])
+        float[] camOrigin = {camPose[12], camPose[13], camPose[14]};
+
+        // Plane point: camOrigin + camForward * 1.0m
+        // The actual distance doesn't affect the direction of (tl3D - bl3D) projected to XZ
+        // for a floor QR (normal ≈ [0,1,0]), because shifting the plane along Y scales both
+        // intersection points equally in Y while leaving their XZ difference unchanged.
+        float[] camForward = {-camPose[8], -camPose[9], -camPose[10]};
+        float[] planePoint = {
+                camOrigin[0] + camForward[0],
+                camOrigin[1] + camForward[1],
+                camOrigin[2] + camForward[2]
+        };
+
+        // Intersect TL (index 0) and BL (index 3) with the plane
+        float[] tl3D = intersectRayPlane(rawImagePoints[0], rawImagePoints[1],
+                fx, fy, cx, cy, camPose, camOrigin, planeNormal, planePoint);
+        float[] bl3D = intersectRayPlane(rawImagePoints[6], rawImagePoints[7],
+                fx, fy, cx, cy, camPose, camOrigin, planeNormal, planePoint);
+
+        if (tl3D == null || bl3D == null) {
+            log("[floorYaw] Ray-plane intersection failed for TL or BL");
+            return null;
+        }
+
+        // QR "up" direction = TL - BL (left edge pointing from bottom-left to top-left)
+        float[] qrUp = {tl3D[0] - bl3D[0], tl3D[1] - bl3D[1], tl3D[2] - bl3D[2]};
+
+        // Project onto horizontal (XZ) plane
+        double ux = qrUp[0];
+        double uz = qrUp[2];
+        double uxzLen = Math.hypot(ux, uz);
+
+        if (uxzLen < 0.15) {
+            log("[floorYaw] QR up-edge has no horizontal extent — degenerate (looking straight down?)");
+            return null;
+        }
+
+        double yaw = Math.toDegrees(Math.atan2(ux, -uz));
+        if (yaw < 0) yaw += 360;
+
+        log(String.format(Locale.US,
+                "[floorYaw] tl3D=(%.3f,%.3f,%.3f) bl3D=(%.3f,%.3f,%.3f) qrUp=(%.3f,%.3f,%.3f) yaw=%.1f°",
+                tl3D[0], tl3D[1], tl3D[2], bl3D[0], bl3D[1], bl3D[2],
+                qrUp[0], qrUp[1], qrUp[2], yaw));
+
+        return yaw;
+    }
+
+    /**
+     * Compute floor QR yaw using getAttitude() rotation matrix + vanishing point edge direction.
+     * Projects the QR's "up" edge direction directly into ENU (East-North-Up) global space,
+     * making the result position-independent. Uses only 2D corners + intrinsics + attitude.
+     *
+     * @param imagePoints  ML Kit corners (8 floats: TL, TR, BR, BL) in image coordinates
+     * @param focalLength  camera intrinsics focal length [fx, fy]
+     * @param principalPt  camera intrinsics principal point [cx, cy]
+     * @return yaw in degrees [0,360) in ENU space, or null on failure
+     */
+    private Double computeFloorYawViaAttitude(float[] imagePoints, float[] focalLength, float[] principalPt) {
+        if (!attitudeValid) {
+            log("[attitudeFloorYaw] Attitude not ready");
+            return null;
+        }
+
+        float fx = focalLength[0], fy = focalLength[1];
+        float cx = principalPt[0], cy = principalPt[1];
+
+        // Vanishing points from 2D corners (homogeneous coordinates)
+        float[] hTL = {imagePoints[0], imagePoints[1], 1f};
+        float[] hTR = {imagePoints[2], imagePoints[3], 1f};
+        float[] hBR = {imagePoints[4], imagePoints[5], 1f};
+        float[] hBL = {imagePoints[6], imagePoints[7], 1f};
+
+        // VP of left/right edges = QR "up" direction in projective space
+        float[] lineLeft  = vec3Cross(hTL, hBL);
+        float[] lineRight = vec3Cross(hTR, hBR);
+        float[] vpY = vec3Cross(lineLeft, lineRight);
+
+        if (Math.abs(vpY[2]) < 1e-6f) {
+            log("[attitudeFloorYaw] VP at infinity — edges are parallel in image");
+            return null;
+        }
+
+        // Convert VP to camera-space ray (QR "up" direction in camera space)
+        float[] rayY = toCameraRay(vpY, fx, fy, cx, cy);
+        if (vec3Len(rayY) < 0.001f) {
+            log("[attitudeFloorYaw] Degenerate VP ray");
+            return null;
+        }
+
+        // Resolve 180° VP ambiguity: ensure rayY points in the QR's "up" direction
+        // (from BL toward TL). Use image-space TL-BL direction as ground truth
+        // since ML Kit corner ordering is based on finder patterns, not camera angle.
+        float vpImgX = vpY[0] / vpY[2];
+        float vpImgY = vpY[1] / vpY[2];
+        float qrCenterX = (imagePoints[0] + imagePoints[2] + imagePoints[4] + imagePoints[6]) / 4f;
+        float qrCenterY = (imagePoints[1] + imagePoints[3] + imagePoints[5] + imagePoints[7]) / 4f;
+        float imgUpX = imagePoints[0] - imagePoints[6]; // TL - BL in image X
+        float imgUpY = imagePoints[1] - imagePoints[7]; // TL - BL in image Y
+        float toVpX = vpImgX - qrCenterX;
+        float toVpY = vpImgY - qrCenterY;
+        if (imgUpX * toVpX + imgUpY * toVpY < 0) {
+            rayY = vec3Scale(rayY, -1f);
+            log("[attitudeFloorYaw] VP flipped to match TL-BL direction");
+        }
+
+        // Transform to ENU using attitude rotation matrix
+        float[] edgeENU = rotateCamToENU(vec3Normalize(rayY), lastAttitudeRotMat, sensorOrientation);
+
+        // Project onto horizontal (East-North) plane
+        double eMag = Math.hypot(edgeENU[0], edgeENU[1]);
+        if (eMag < 0.15) {
+            log("[attitudeFloorYaw] QR up-edge has no horizontal extent in ENU — degenerate");
+            return null;
+        }
+
+        // Yaw = atan2(East, North) — compass bearing convention
+        double yaw = Math.toDegrees(Math.atan2(edgeENU[0], edgeENU[1]));
+        if (yaw < 0) yaw += 360.0;
+
+        log(String.format(Locale.US,
+                "[attitudeFloorYaw] edgeENU=(%.3f,%.3f,%.3f) hMag=%.3f yaw=%.1f°",
+                edgeENU[0], edgeENU[1], edgeENU[2], eMag, yaw));
+
+        return yaw;
+    }
+
+    /**
+     * Human-readable label for a pitch angle.
+     */
+    private static String pitchLabel(double pitch) {
+        double abs = Math.abs(pitch);
+        if (abs < 25) return "Wall";
+        if (abs < 65) return "Tilted";
+        return "Floor";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1154,8 +1492,6 @@ public class MainActivity extends AppCompatActivity {
 
         lastAcceptedImagePoints = bestImagePoints;
         lastAcceptedViewPoints = bestViewPoints;
-        log(String.format(Locale.US, "[QR] stabilized corner rotation=%d score=%.1f",
-                bestRotation, bestScore));
         return new float[][]{bestImagePoints, bestViewPoints};
     }
 
@@ -1232,6 +1568,11 @@ public class MainActivity extends AppCompatActivity {
                                 pts[2].x, pts[2].y, pts[3].x, pts[3].y
                         };
 
+                        // Preserve raw ML Kit corners BEFORE stabilization.
+                        // For floor QR yaw, we need the original corner identity
+                        // (TL/BL based on finder patterns) which stabilization can rotate.
+                        final float[] rawImagePointsCopy = imagePoints.clone();
+
                         float[] viewPoints = new float[8];
                         try {
                             capturedFrame.transformCoordinates2d(
@@ -1254,7 +1595,7 @@ public class MainActivity extends AppCompatActivity {
                             onQRPayloadDetected(payload);
 
                             if (isSampling && !isCollectingMag) {
-                                collectSampleWithPose(stabilizedImagePoints, capturedPose, capturedIntrinsics, capturedFrame);
+                                collectSampleWithPose(stabilizedImagePoints, rawImagePointsCopy, capturedPose, capturedIntrinsics, capturedFrame);
                             }
                         });
                     })
@@ -1280,7 +1621,8 @@ public class MainActivity extends AppCompatActivity {
 // UI Helpers
 // ─────────────────────────────────────────────────────────────────────────
     private void updateInfoLabel(Double rawYaw, Double finalYaw, Double currentOffset,
-                                 QRDatabaseHelper.Registration reg, Double delta, InfoSource source) {
+                                 QRDatabaseHelper.Registration reg, Double yawDelta, Double pitchDelta,
+                                 InfoSource source) {
         List<String> lines = new ArrayList<>();
 
         // 1. Raw Mag Samples Dump
@@ -1310,6 +1652,7 @@ public class MainActivity extends AppCompatActivity {
                 lines.add(String.format(Locale.US, "Math    : [%.1f° raw] + [%.1f° offset]", rawRegYaw, regOffset));
             }
             lines.add(String.format(Locale.US, "Reg Yaw : %.1f°", reg.yaw));
+            lines.add(String.format(Locale.US, "Reg Pitch: %.1f° (%s)", reg.pitchDegrees, pitchLabel(reg.pitchDegrees)));
             lines.add("──────────────────────────");
         }
 
@@ -1321,10 +1664,25 @@ public class MainActivity extends AppCompatActivity {
         }
 
         // 5. FINAL RESULT / DELTA
-        if (delta != null) {
+        if (yawDelta != null) {
             lines.add("──────────────────────────");
-            lines.add(String.format(Locale.US, "Δ Delta : %+.1f°  (tol ±%.0f°)", delta, DEFAULT_TOLERANCE));
-            lines.add("Result  : " + (Math.abs(delta) <= DEFAULT_TOLERANCE ? "✅ SAME POSITION" : "❌ MOVED"));
+            lines.add(String.format(Locale.US, "Δ Yaw   : %+.1f°  (tol ±%.0f°)", yawDelta, DEFAULT_TOLERANCE));
+            boolean yawOK = Math.abs(yawDelta) <= DEFAULT_TOLERANCE;
+            if (pitchDelta != null) {
+                lines.add(String.format(Locale.US, "Δ Pitch : %+.1f°  (tol ±%.0f°)", pitchDelta, PITCH_TOLERANCE));
+                boolean pitchOK = Math.abs(pitchDelta) <= PITCH_TOLERANCE;
+                if (yawOK && pitchOK) {
+                    lines.add("Result  : ✅ SAME POSITION & ORIENTATION");
+                } else if (!pitchOK && yawOK) {
+                    lines.add("Result  : ❌ SURFACE CHANGED");
+                } else if (!yawOK && pitchOK) {
+                    lines.add("Result  : ❌ DIRECTION CHANGED");
+                } else {
+                    lines.add("Result  : ❌ MOVED (yaw + surface)");
+                }
+            } else {
+                lines.add("Result  : " + (yawOK ? "✅ SAME POSITION" : "❌ MOVED"));
+            }
         }
 
         // Push to UI

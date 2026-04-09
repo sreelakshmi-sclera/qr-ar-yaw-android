@@ -26,7 +26,7 @@ import java.util.List;
 public class QRDatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DB_NAME    = "qryaw.db";
-    private static final int    DB_VERSION = 1;
+    private static final int    DB_VERSION = 2;
 
     // ── Singleton ──────────────────────────────────────────────────────────────
     private static QRDatabaseHelper instance;
@@ -72,6 +72,7 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                         "  normal_x       REAL," +
                         "  normal_y       REAL," +
                         "  normal_z       REAL," +
+                        "  pitch_degrees  REAL    NOT NULL DEFAULT 0.0," +
                         "  tolerance      REAL," +
                         "  registered_at  INTEGER," +       // epoch-ms
                         "  device         TEXT," +           // Build.MODEL  (≡ iOS deviceModel)
@@ -81,15 +82,19 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
 
         db.execSQL(
                 "CREATE TABLE validations (" +
-                        "  id                INTEGER PRIMARY KEY AUTOINCREMENT," +
-                        "  registration_id   INTEGER," +
-                        "  payload           TEXT," +
-                        "  current_yaw       REAL," +
-                        "  registered_yaw    REAL," +
-                        "  delta             REAL," +
-                        "  within_tolerance  INTEGER," +     // 0 or 1
-                        "  tolerance         REAL," +
-                        "  validated_at      INTEGER," +     // epoch-ms
+                        "  id                       INTEGER PRIMARY KEY AUTOINCREMENT," +
+                        "  registration_id          INTEGER," +
+                        "  payload                  TEXT," +
+                        "  current_yaw              REAL," +
+                        "  registered_yaw           REAL," +
+                        "  delta                    REAL," +
+                        "  within_tolerance         INTEGER," +     // 0 or 1
+                        "  tolerance                REAL," +
+                        "  current_pitch            REAL    NOT NULL DEFAULT 0.0," +
+                        "  registered_pitch         REAL    NOT NULL DEFAULT 0.0," +
+                        "  pitch_delta              REAL    NOT NULL DEFAULT 0.0," +
+                        "  pitch_within_tolerance   INTEGER NOT NULL DEFAULT 1," +
+                        "  validated_at             INTEGER," +     // epoch-ms
                         "  FOREIGN KEY(registration_id) REFERENCES registrations(id)" +
                         ")"
         );
@@ -97,9 +102,13 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        db.execSQL("DROP TABLE IF EXISTS validations");
-        db.execSQL("DROP TABLE IF EXISTS registrations");
-        onCreate(db);
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE registrations ADD COLUMN pitch_degrees REAL NOT NULL DEFAULT 0.0");
+            db.execSQL("ALTER TABLE validations ADD COLUMN current_pitch REAL NOT NULL DEFAULT 0.0");
+            db.execSQL("ALTER TABLE validations ADD COLUMN registered_pitch REAL NOT NULL DEFAULT 0.0");
+            db.execSQL("ALTER TABLE validations ADD COLUMN pitch_delta REAL NOT NULL DEFAULT 0.0");
+            db.execSQL("ALTER TABLE validations ADD COLUMN pitch_within_tolerance INTEGER NOT NULL DEFAULT 1");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -113,12 +122,13 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
      * @return the row-id of the inserted/replaced row, or null on failure.
      */
     public Long saveRegistration(String payload,
-                                 double yaw,
+                                 double yaw, double pitch,
                                  double nx, double ny, double nz,
                                  double tolerance) {
         ContentValues cv = new ContentValues();
         cv.put("payload",       payload);
         cv.put("yaw",           yaw);
+        cv.put("pitch_degrees", pitch);
         cv.put("normal_x",      nx);
         cv.put("normal_y",      ny);
         cv.put("normal_z",      nz);
@@ -191,16 +201,24 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                                double registeredYaw,
                                double delta,
                                boolean withinTolerance,
-                               double tolerance) {
+                               double tolerance,
+                               double currentPitch,
+                               double registeredPitch,
+                               double pitchDelta,
+                               boolean pitchWithinTolerance) {
         ContentValues cv = new ContentValues();
-        cv.put("registration_id",  registrationId);
-        cv.put("payload",          payload);
-        cv.put("current_yaw",      currentYaw);
-        cv.put("registered_yaw",   registeredYaw);
-        cv.put("delta",            delta);
-        cv.put("within_tolerance", withinTolerance ? 1 : 0);
-        cv.put("tolerance",        tolerance);
-        cv.put("validated_at",     System.currentTimeMillis());
+        cv.put("registration_id",        registrationId);
+        cv.put("payload",                payload);
+        cv.put("current_yaw",            currentYaw);
+        cv.put("registered_yaw",         registeredYaw);
+        cv.put("delta",                  delta);
+        cv.put("within_tolerance",       withinTolerance ? 1 : 0);
+        cv.put("tolerance",              tolerance);
+        cv.put("current_pitch",          currentPitch);
+        cv.put("registered_pitch",       registeredPitch);
+        cv.put("pitch_delta",            pitchDelta);
+        cv.put("pitch_within_tolerance", pitchWithinTolerance ? 1 : 0);
+        cv.put("validated_at",           System.currentTimeMillis());
         getDb().insert("validations", null, cv);
     }
 
@@ -219,15 +237,19 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         try {
             while (c.moveToNext()) {
                 Validation v = new Validation();
-                v.id             = c.getLong   (c.getColumnIndexOrThrow("id"));
-                v.registrationId = c.getLong   (c.getColumnIndexOrThrow("registration_id"));
-                v.payload        = c.getString (c.getColumnIndexOrThrow("payload"));
-                v.currentYaw     = c.getDouble (c.getColumnIndexOrThrow("current_yaw"));
-                v.registeredYaw  = c.getDouble (c.getColumnIndexOrThrow("registered_yaw"));
-                v.delta          = c.getDouble (c.getColumnIndexOrThrow("delta"));
-                v.withinTolerance= c.getInt    (c.getColumnIndexOrThrow("within_tolerance")) == 1;
-                v.tolerance      = c.getDouble (c.getColumnIndexOrThrow("tolerance"));
-                v.validatedAt    = new Date    (c.getLong(c.getColumnIndexOrThrow("validated_at")));
+                v.id                  = c.getLong   (c.getColumnIndexOrThrow("id"));
+                v.registrationId      = c.getLong   (c.getColumnIndexOrThrow("registration_id"));
+                v.payload             = c.getString (c.getColumnIndexOrThrow("payload"));
+                v.currentYaw          = c.getDouble (c.getColumnIndexOrThrow("current_yaw"));
+                v.registeredYaw       = c.getDouble (c.getColumnIndexOrThrow("registered_yaw"));
+                v.delta               = c.getDouble (c.getColumnIndexOrThrow("delta"));
+                v.withinTolerance     = c.getInt    (c.getColumnIndexOrThrow("within_tolerance")) == 1;
+                v.tolerance           = c.getDouble (c.getColumnIndexOrThrow("tolerance"));
+                v.currentPitch        = c.getDouble (c.getColumnIndexOrThrow("current_pitch"));
+                v.registeredPitch     = c.getDouble (c.getColumnIndexOrThrow("registered_pitch"));
+                v.pitchDelta          = c.getDouble (c.getColumnIndexOrThrow("pitch_delta"));
+                v.pitchWithinTolerance= c.getInt    (c.getColumnIndexOrThrow("pitch_within_tolerance")) == 1;
+                v.validatedAt         = new Date    (c.getLong(c.getColumnIndexOrThrow("validated_at")));
                 list.add(v);
             }
         } finally {
@@ -245,6 +267,7 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         r.id           = c.getLong  (c.getColumnIndexOrThrow("id"));
         r.payload      = c.getString(c.getColumnIndexOrThrow("payload"));
         r.yaw          = c.getDouble(c.getColumnIndexOrThrow("yaw"));
+        r.pitchDegrees = c.getDouble(c.getColumnIndexOrThrow("pitch_degrees"));
         r.normalX      = c.getDouble(c.getColumnIndexOrThrow("normal_x"));
         r.normalY      = c.getDouble(c.getColumnIndexOrThrow("normal_y"));
         r.normalZ      = c.getDouble(c.getColumnIndexOrThrow("normal_z"));
@@ -275,6 +298,7 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         public long   id;
         public String payload;
         public double yaw;
+        public double pitchDegrees;  // 0=wall, +90=floor
         public double normalX, normalY, normalZ;
         public double tolerance;
         public Date   registeredAt;
@@ -292,6 +316,10 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         public double  delta;
         public boolean withinTolerance;
         public double  tolerance;
+        public double  currentPitch;
+        public double  registeredPitch;
+        public double  pitchDelta;
+        public boolean pitchWithinTolerance;
         public Date    validatedAt;
     }
 }
