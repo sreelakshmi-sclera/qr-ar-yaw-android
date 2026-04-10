@@ -52,6 +52,15 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
+    implementation("com.google.zxing:core:3.5.3")
+    // 1. The Core OpenCV library (pre-compiled by Jenly)
+    implementation("com.github.jenly1314.WeChatQRCode:opencv:2.4.0")
+
+    // 2. The native C++ binaries for modern Android phones (add x86_64 if using an emulator)
+    implementation("com.github.jenly1314.WeChatQRCode:opencv-armv64:2.4.0")
+
+    // 3. The WeChat QRCode specific wrapper
+    implementation("com.github.jenly1314.WeChatQRCode:wechat-qrcode:2.4.0")
 }
 configurations.all {
     resolutionStrategy {
