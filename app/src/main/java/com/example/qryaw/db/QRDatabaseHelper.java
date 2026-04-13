@@ -26,7 +26,7 @@ import java.util.List;
 public class QRDatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DB_NAME    = "qryaw.db";
-    private static final int    DB_VERSION = 1;
+    private static final int    DB_VERSION = 2;
 
     // ── Singleton ──────────────────────────────────────────────────────────────
     private static QRDatabaseHelper instance;
@@ -69,6 +69,8 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                         "  id             INTEGER PRIMARY KEY AUTOINCREMENT," +
                         "  payload        TEXT    UNIQUE NOT NULL," +
                         "  yaw            REAL    NOT NULL," +
+                        "  pitch          REAL," +
+                        "  roll           REAL," +
                         "  normal_x       REAL," +
                         "  normal_y       REAL," +
                         "  normal_z       REAL," +
@@ -87,6 +89,12 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                         "  current_yaw       REAL," +
                         "  registered_yaw    REAL," +
                         "  delta             REAL," +
+                        "  current_pitch     REAL," +
+                        "  registered_pitch  REAL," +
+                        "  delta_pitch       REAL," +
+                        "  current_roll      REAL," +
+                        "  registered_roll   REAL," +
+                        "  delta_roll        REAL," +
                         "  within_tolerance  INTEGER," +     // 0 or 1
                         "  tolerance         REAL," +
                         "  validated_at      INTEGER," +     // epoch-ms
@@ -97,9 +105,17 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        db.execSQL("DROP TABLE IF EXISTS validations");
-        db.execSQL("DROP TABLE IF EXISTS registrations");
-        onCreate(db);
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE registrations ADD COLUMN pitch REAL");
+            db.execSQL("ALTER TABLE registrations ADD COLUMN roll REAL");
+
+            db.execSQL("ALTER TABLE validations ADD COLUMN current_pitch REAL");
+            db.execSQL("ALTER TABLE validations ADD COLUMN registered_pitch REAL");
+            db.execSQL("ALTER TABLE validations ADD COLUMN delta_pitch REAL");
+            db.execSQL("ALTER TABLE validations ADD COLUMN current_roll REAL");
+            db.execSQL("ALTER TABLE validations ADD COLUMN registered_roll REAL");
+            db.execSQL("ALTER TABLE validations ADD COLUMN delta_roll REAL");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -114,11 +130,15 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
      */
     public Long saveRegistration(String payload,
                                  double yaw,
+                                 double pitch,
+                                 double roll,
                                  double nx, double ny, double nz,
                                  double tolerance) {
         ContentValues cv = new ContentValues();
         cv.put("payload",       payload);
         cv.put("yaw",           yaw);
+        putNullableDouble(cv, "pitch", pitch);
+        putNullableDouble(cv, "roll", roll);
         cv.put("normal_x",      nx);
         cv.put("normal_y",      ny);
         cv.put("normal_z",      nz);
@@ -189,7 +209,13 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                                String payload,
                                double currentYaw,
                                double registeredYaw,
-                               double delta,
+                               double deltaYaw,
+                               double currentPitch,
+                               double registeredPitch,
+                               double deltaPitch,
+                               double currentRoll,
+                               double registeredRoll,
+                               double deltaRoll,
                                boolean withinTolerance,
                                double tolerance) {
         ContentValues cv = new ContentValues();
@@ -197,7 +223,13 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         cv.put("payload",          payload);
         cv.put("current_yaw",      currentYaw);
         cv.put("registered_yaw",   registeredYaw);
-        cv.put("delta",            delta);
+        cv.put("delta",            deltaYaw);
+        putNullableDouble(cv, "current_pitch", currentPitch);
+        putNullableDouble(cv, "registered_pitch", registeredPitch);
+        putNullableDouble(cv, "delta_pitch", deltaPitch);
+        putNullableDouble(cv, "current_roll", currentRoll);
+        putNullableDouble(cv, "registered_roll", registeredRoll);
+        putNullableDouble(cv, "delta_roll", deltaRoll);
         cv.put("within_tolerance", withinTolerance ? 1 : 0);
         cv.put("tolerance",        tolerance);
         cv.put("validated_at",     System.currentTimeMillis());
@@ -225,6 +257,12 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
                 v.currentYaw     = c.getDouble (c.getColumnIndexOrThrow("current_yaw"));
                 v.registeredYaw  = c.getDouble (c.getColumnIndexOrThrow("registered_yaw"));
                 v.delta          = c.getDouble (c.getColumnIndexOrThrow("delta"));
+                v.currentPitch   = readNullableDouble(c, "current_pitch");
+                v.registeredPitch= readNullableDouble(c, "registered_pitch");
+                v.deltaPitch     = readNullableDouble(c, "delta_pitch");
+                v.currentRoll    = readNullableDouble(c, "current_roll");
+                v.registeredRoll = readNullableDouble(c, "registered_roll");
+                v.deltaRoll      = readNullableDouble(c, "delta_roll");
                 v.withinTolerance= c.getInt    (c.getColumnIndexOrThrow("within_tolerance")) == 1;
                 v.tolerance      = c.getDouble (c.getColumnIndexOrThrow("tolerance"));
                 v.validatedAt    = new Date    (c.getLong(c.getColumnIndexOrThrow("validated_at")));
@@ -245,6 +283,8 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         r.id           = c.getLong  (c.getColumnIndexOrThrow("id"));
         r.payload      = c.getString(c.getColumnIndexOrThrow("payload"));
         r.yaw          = c.getDouble(c.getColumnIndexOrThrow("yaw"));
+        r.pitch        = readNullableDouble(c, "pitch");
+        r.roll         = readNullableDouble(c, "roll");
         r.normalX      = c.getDouble(c.getColumnIndexOrThrow("normal_x"));
         r.normalY      = c.getDouble(c.getColumnIndexOrThrow("normal_y"));
         r.normalZ      = c.getDouble(c.getColumnIndexOrThrow("normal_z"));
@@ -266,6 +306,22 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         }
     }
 
+    private void putNullableDouble(ContentValues cv, String key, double value) {
+        if (Double.isNaN(value)) {
+            cv.putNull(key);
+        } else {
+            cv.put(key, value);
+        }
+    }
+
+    private double readNullableDouble(Cursor c, String columnName) {
+        int index = c.getColumnIndex(columnName);
+        if (index < 0 || c.isNull(index)) {
+            return Double.NaN;
+        }
+        return c.getDouble(index);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Data classes  (mirrors iOS structs)
     // ─────────────────────────────────────────────────────────────────────────
@@ -275,6 +331,8 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         public long   id;
         public String payload;
         public double yaw;
+        public double pitch = Double.NaN;
+        public double roll = Double.NaN;
         public double normalX, normalY, normalZ;
         public double tolerance;
         public Date   registeredAt;
@@ -290,6 +348,12 @@ public class QRDatabaseHelper extends SQLiteOpenHelper {
         public double  currentYaw;
         public double  registeredYaw;
         public double  delta;
+        public double  currentPitch = Double.NaN;
+        public double  registeredPitch = Double.NaN;
+        public double  deltaPitch = Double.NaN;
+        public double  currentRoll = Double.NaN;
+        public double  registeredRoll = Double.NaN;
+        public double  deltaRoll = Double.NaN;
         public boolean withinTolerance;
         public double  tolerance;
         public Date    validatedAt;
