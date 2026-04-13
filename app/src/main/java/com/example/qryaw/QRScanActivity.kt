@@ -12,7 +12,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
@@ -66,11 +69,11 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-class MainActivity : AppCompatActivity() {
+open class QRScanActivity : AppCompatActivity() {
     // ── UI Components ──
-    private var arSceneView: ARSceneView? = null
+    protected var arSceneView: ARSceneView? = null
 //    private var overlayView: QROverlayView? = null
-    private var blueBorder: QrBlueBorder? = null
+    protected var blueBorder: QrBlueBorder? = null
 
     // ── Timeout ──
     private val timeoutHandler = Handler(Looper.getMainLooper())
@@ -671,6 +674,7 @@ class MainActivity : AppCompatActivity() {
         activeSamplingSession = null
         isSampling = false
         isCollectingMag = false
+        committedPayload = null
     }
 
     private fun abortActiveSampling(reason: String?) {
@@ -903,6 +907,7 @@ class MainActivity : AppCompatActivity() {
 
         val payload = session.payload
         val isAbsoluteNorth = session.absoluteNorth == true
+        val finalPitch = inputPitch
         val finalRoll = normalizeDegrees(inputRoll)
 
         val offsetUsed: Double
@@ -925,18 +930,18 @@ class MainActivity : AppCompatActivity() {
         samplingOffsetAnchor = Double.NaN
         committedPayload = payload
 
-        Log.d("test", "commitReading: purpose=${session.purpose} payload=$payload yaw=$finalNorthYaw pitch=$inputPitch roll=$finalRoll")
+        Log.d("test", "commitReading: purpose=${session.purpose} payload=$payload yaw=$finalNorthYaw pitch=$finalPitch roll=$finalRoll")
         if (session.purpose == SamplingPurpose.REGISTER) {
             persistOffsetMetadata(payload, isAbsoluteNorth, offsetUsed)
             val resultIntent = android.content.Intent().apply {
                 putExtra("url", payload)
                 putExtra("yaw", finalNorthYaw)
-                putExtra("pitch", inputPitch)
+                putExtra("pitch", finalPitch)
                 putExtra("roll", finalRoll)
             }
             runOnUiThread {
                 setResult(RESULT_OK, resultIntent)
-                finish()
+//                finish()
             }
         } else {
             val storedOffset = readStoredRelativeOffset(payload)

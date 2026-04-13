@@ -12,18 +12,6 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <com.example.qryaw.QrBlueBorder
-        android:id="@+id/blue_border"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"/>
-
-<!--    <com.example.qryaw.QROverlayView-->
-<!--        android:id="@+id/overlay_view"-->
-<!--        android:layout_width="match_parent"-->
-<!--        android:layout_height="match_parent"-->
-<!--        tools:layout_editor_absoluteX="-170dp"-->
-<!--        tools:layout_editor_absoluteY="0dp" />-->
-
     <androidx.appcompat.widget.Toolbar
         android:id="@+id/toolbar"
         android:layout_width="0dp"
@@ -37,15 +25,6 @@
         app:title="QR Scanner"
         app:titleTextColor="#FFFFFF" />
 
-    <TextView
-        android:id="@+id/textView"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="160dp"
-        android:text="Please stick QR to fixed parts."
-        android:textColor="#FFFFFF"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent" />
+
 
 </androidx.constraintlayout.widget.ConstraintLayout>

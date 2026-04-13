@@ -38,6 +38,18 @@
 
         </activity>
 
+        <activity
+            android:name=".VerifyActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout">
+
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="sceneform" />
+
+        </activity>
+
     </application>
 
 </manifest>

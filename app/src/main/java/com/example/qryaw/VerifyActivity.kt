@@ -66,11 +66,11 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-class MainActivity : AppCompatActivity() {
+class VerifyActivity : AppCompatActivity() {
     // ── UI Components ──
     private var arSceneView: ARSceneView? = null
 //    private var overlayView: QROverlayView? = null
-    private var blueBorder: QrBlueBorder? = null
+//    private var blueBorder: QrBlueBorder? = null
 
     // ── Timeout ──
     private val timeoutHandler = Handler(Looper.getMainLooper())
@@ -98,6 +98,7 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile
     private var isSampling = false
+
     @Volatile
     private var committedPayload: String? = null
     private val sampleBuffer: MutableList<YawSample> = ArrayList<YawSample>()
@@ -196,18 +197,14 @@ class MainActivity : AppCompatActivity() {
 
         arSceneView!!.sessionConfiguration = { session: Session?, config: Config? ->
             config!!.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL)
-            null
         }
-//
-//        runOnUiThread {
-//            overlayView!!.setCorners(null)
-//        }
 
         arSceneView!!.postDelayed({
             checkArCoreAndStart()
             startFOP()
         }, 500)
     }
+
     private val fopListener: DeviceOrientationListener = object : DeviceOrientationListener {
         @SuppressLint("SetTextI18n")
         override fun onDeviceOrientationChanged(orientation: DeviceOrientation) {
@@ -451,12 +448,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        setContentView(R.layout.activity_verify)
         timeoutHandler.postDelayed(timeoutRunnable, 15_000L)
 
         arSceneView = findViewById(R.id.ar_scene_view)
 //        overlayView = findViewById(R.id.overlay_view)
-        blueBorder = findViewById(R.id.blue_border)
+//        blueBorder = findViewById(R.id.blue_border)
 //        statusText = findViewById(R.id.status_text)
 
         OpenCV.initOpenCV()
@@ -477,11 +474,13 @@ class MainActivity : AppCompatActivity() {
         if (hasCamera) {
             checkArCoreAndStart()
         } else {
-            permissionLauncher.launch(arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ))
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
         }
     }
 
@@ -523,7 +522,8 @@ class MainActivity : AppCompatActivity() {
         if (fusedOrientationClient == null || isFopRegistered) return
         isFopRegistered = true
 
-        val request = DeviceOrientationRequest.Builder(DeviceOrientationRequest.OUTPUT_PERIOD_FAST).build()
+        val request =
+            DeviceOrientationRequest.Builder(DeviceOrientationRequest.OUTPUT_PERIOD_FAST).build()
         fusedOrientationClient!!
             .requestOrientationUpdates(request, ensureFopExecutor()!!, fopListener)
             .addOnSuccessListener(OnSuccessListener { _: Void? -> })
@@ -583,7 +583,10 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing) return
         val session = activeSamplingSession
         if (session != null && payload != session.payload) {
-            Log.d("test", "onQRPayloadDetected: QR changed, aborting: old=${session.payload} new=$payload")
+            Log.d(
+                "test",
+                "onQRPayloadDetected: QR changed, aborting: old=${session.payload} new=$payload"
+            )
             abortActiveSampling("QR changed during sampling. Try again.")
         }
         if (isSampling) return
@@ -594,7 +597,6 @@ class MainActivity : AppCompatActivity() {
 
     private val isAlignmentReady: Boolean
         get() = !lastRawMagHeading.isNaN()
-
 
 
     private val offsetPreferences: SharedPreferences
@@ -706,7 +708,10 @@ class MainActivity : AppCompatActivity() {
         framePayload: String?
     ) {
         val session = activeSamplingSession
-        Log.d("test", "collectSampleWithPose: isSampling=$isSampling session=${session?.payload} framePayload=$framePayload fopAttitude=${resolvedFopAttitude?.attitude != null}")
+        Log.d(
+            "test",
+            "collectSampleWithPose: isSampling=$isSampling session=${session?.payload} framePayload=$framePayload fopAttitude=${resolvedFopAttitude?.attitude != null}"
+        )
         if (!isSampling || session == null) {
             Log.d("test", "collectSampleWithPose: skipped – not sampling or no session")
             return
@@ -721,7 +726,10 @@ class MainActivity : AppCompatActivity() {
             intrinsics,
             resolvedFopAttitude?.attitude
         )
-        Log.d("test", "computeQRYaw result: yaw=${result?.yaw} pitch=${result?.pitch} roll=${result?.roll} method=${result?.method}")
+        Log.d(
+            "test",
+            "computeQRYaw result: yaw=${result?.yaw} pitch=${result?.pitch} roll=${result?.roll} method=${result?.method}"
+        )
 
         if (result == null) {
             Log.d("test", "collectSampleWithPose: computeQRYaw returned null")
@@ -805,7 +813,10 @@ class MainActivity : AppCompatActivity() {
                 45.0
 
             if (yawDiff > outlierThreshold || rollDiff > outlierThreshold || pitchDiff > PITCH_OUTLIER_THRESHOLD_DEG) {
-                Log.w("test", "processSample: outlier yawDiff=$yawDiff rollDiff=$rollDiff pitchDiff=$pitchDiff (thresholds: yaw/roll=$outlierThreshold pitch=$PITCH_OUTLIER_THRESHOLD_DEG)")
+                Log.w(
+                    "test",
+                    "processSample: outlier yawDiff=$yawDiff rollDiff=$rollDiff pitchDiff=$pitchDiff (thresholds: yaw/roll=$outlierThreshold pitch=$PITCH_OUTLIER_THRESHOLD_DEG)"
+                )
                 if (sampleConfidence >= DIRECT_SAMPLE_RESET_CONFIDENCE
                     && sampleBuffer.get(0).weight < 0.5
                 ) {
@@ -819,7 +830,10 @@ class MainActivity : AppCompatActivity() {
 
         val now = System.currentTimeMillis()
         if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
-            Log.w("test", "processSample: sample gap ${now - lastSampleTime}ms > ${MAX_SAMPLE_GAP_MS}ms — buffer cleared (had ${sampleBuffer.size} samples)")
+            Log.w(
+                "test",
+                "processSample: sample gap ${now - lastSampleTime}ms > ${MAX_SAMPLE_GAP_MS}ms — buffer cleared (had ${sampleBuffer.size} samples)"
+            )
             sampleBuffer.clear()
         }
         lastSampleTime = now
@@ -834,7 +848,10 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
-        Log.d("test", "processSample: sample added buffer=${sampleBuffer.size}/$REQUIRED_SAMPLES  yaw=$sampleNorth  pitch=${result.pitch}  roll=$sampleRoll")
+        Log.d(
+            "test",
+            "processSample: sample added buffer=${sampleBuffer.size}/$REQUIRED_SAMPLES  yaw=$sampleNorth  pitch=${result.pitch}  roll=$sampleRoll"
+        )
         if (sampleBuffer.size >= REQUIRED_SAMPLES) {
             isSampling = false
 
@@ -925,7 +942,10 @@ class MainActivity : AppCompatActivity() {
         samplingOffsetAnchor = Double.NaN
         committedPayload = payload
 
-        Log.d("test", "commitReading: purpose=${session.purpose} payload=$payload yaw=$finalNorthYaw pitch=$inputPitch roll=$finalRoll")
+        Log.d(
+            "test",
+            "commitReading: purpose=${session.purpose} payload=$payload yaw=$finalNorthYaw pitch=$inputPitch roll=$finalRoll"
+        )
         if (session.purpose == SamplingPurpose.REGISTER) {
             persistOffsetMetadata(payload, isAbsoluteNorth, offsetUsed)
             val resultIntent = android.content.Intent().apply {
@@ -1352,7 +1372,6 @@ class MainActivity : AppCompatActivity() {
                         val qrTrulyLost = (now - lastQrSeenTime) > QR_LOST_TIMEOUT_MS
                         if (qrTrulyLost) {
                             runOnUiThread {
-//                                overlayView!!.setCorners(null)
                                 lastDetectedCorners = null
                                 if (isSampling) {
                                     abortActiveSampling("⚠️ QR lost during sampling. Try again.")
@@ -1400,26 +1419,18 @@ class MainActivity : AppCompatActivity() {
                     val cornersList = toCornerList(viewPoints)
 
                     runOnUiThread {
-                        val scanRect = blueBorder?.getScanRect()
-                        Log.d("test", "processARFrame: scanRect=$scanRect  blueBorder=$blueBorder")
-
-                        val insideScanArea = scanRect != null && (0 until 4).all { i ->
-                            scanRect.contains(viewPoints[i * 2], viewPoints[i * 2 + 1])
-                        }
-                        Log.d("test", "processARFrame: insideScanArea=$insideScanArea  viewPoints=${viewPoints.toList()}")
-
-                        val angleOk = insideScanArea &&
-                                isViewingAngleAcceptable(imagePoints, capturedPose, capturedIntrinsics)
-                        Log.d("test", "processARFrame: angleOk=$angleOk  insideScanArea=$insideScanArea")
-
                         lastDetectedCorners = cornersList
-//                        overlayView!!.setCorners(if (angleOk) cornersList else null)
-                        if (!angleOk) return@runOnUiThread
 
-                        Log.d("test", "processARFrame: calling onQRPayloadDetected isSampling=$isSampling")
+                        Log.d(
+                            "test",
+                            "processARFrame: calling onQRPayloadDetected isSampling=$isSampling"
+                        )
                         onQRPayloadDetected(payload)
 
-                        Log.d("test", "processARFrame: after onQRPayloadDetected isSampling=$isSampling isCollectingMag=$isCollectingMag samplingOffsetAnchor=$samplingOffsetAnchor")
+                        Log.d(
+                            "test",
+                            "processARFrame: after onQRPayloadDetected isSampling=$isSampling isCollectingMag=$isCollectingMag samplingOffsetAnchor=$samplingOffsetAnchor"
+                        )
                         if (isSampling && !isCollectingMag && !samplingOffsetAnchor.isNaN()) {
                             Log.d("test", "processARFrame: calling collectSampleWithPose")
                             val resolvedFopAttitude = resolveFopAttitudeForFrame(

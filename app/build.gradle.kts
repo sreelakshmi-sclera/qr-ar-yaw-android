@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
 }
 
 android {
@@ -29,6 +30,9 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    kotlinOptions {
+        jvmTarget = "11"
+    }
     // Jetifier rewrites old support → androidx imports at build time
     // (very important when old libs are present)
 }
@@ -49,6 +53,7 @@ dependencies {
     implementation("io.github.sceneview:sceneview:2.3.0")
     implementation("io.github.sceneview:arsceneview:2.3.0")
     implementation(libs.play.services.location)
+    implementation(libs.core.ktx)
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
@@ -65,6 +70,8 @@ dependencies {
 configurations.all {
     resolutionStrategy {
 //        force("androidx.activity:activity:1.8.2")
-        force("com.google.ar:core:1.46.0" )
+        force("com.google.ar:core:1.46.0")
+        force("androidx.core:core:1.15.0")
+        force("androidx.core:core-ktx:1.15.0")
     }
 }
