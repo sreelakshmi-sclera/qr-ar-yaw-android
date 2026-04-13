@@ -60,6 +60,7 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.sceneview.ar.ARSceneView;
 import kotlin.Unit;
@@ -72,9 +73,9 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUIRED_SAMPLES = 8;
     private static final double MIN_SAMPLE_WEIGHT = 0.15;
     private static final double YAW_TOLERANCE = 30.0;   // Loose: Absorbs magnetic drift
-    private static final double PITCH_TOLERANCE = 10.0; // Tight: Gravity is stable
-    private static final double ROLL_TOLERANCE = 10.0;  // Tight: PnP optics are stable
-    private static final float HEADING_ERROR_GATE = 40.0f;
+    private static final double PITCH_TOLERANCE = 20.0; // Tight: Gravity is stable
+    private static final double ROLL_TOLERANCE = 20.0;  // Tight: PnP optics are stable
+    private static final float HEADING_ERROR_GATE = 90.0f;
     private static final int MAG_SAMPLES_REQUIRED = 15;
     private static final long MAX_SAMPLE_GAP_MS = 400;
     private static final long QR_LOST_TIMEOUT_MS = 500;
@@ -115,7 +116,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean isCollectingMag = false;
     private double samplingOffsetAnchor = Double.NaN;
     private volatile double lastRawMagHeading = Double.NaN;
-    private volatile float[] lastFopAttitude = null;
+    private volatile TimedAttitude lastFopSample = null;
     private volatile String lastPayload;
     private volatile QRDatabaseHelper.Registration currentRegistration;
     private volatile boolean isSampling = false;
@@ -126,7 +127,6 @@ public class MainActivity extends AppCompatActivity {
     private long lastQrSeenTime = 0;
     private long lastSubPixLogTime = 0;
     private final AtomicBoolean isProcessingFrame = new AtomicBoolean(false);
-    private volatile long lastFopElapsedRealtimeNs = 0L;
     private int backCameraSensorOrientationDegrees = 90;
     private int consecutiveNonDirectFallbacks = 0;
     private long nextSamplingSessionId = 1L;
@@ -134,7 +134,10 @@ public class MainActivity extends AppCompatActivity {
 
     private final ExecutorService qrExecutor = Executors.newSingleThreadExecutor();
     private ExecutorService fopExecutor;
-    private boolean isFopRegistered = false;
+    private volatile boolean isFopRegistered = false;
+    private volatile int activeFopGeneration = 0;
+    private final AtomicInteger nextFopGeneration = new AtomicInteger(1);
+    private DeviceOrientationListener activeFopListener = null;
     private final Object fopHistoryLock = new Object();
     private final ArrayDeque<TimedAttitude> fopAttitudeHistory = new ArrayDeque<>();
 
@@ -304,91 +307,100 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Device Orientation Listener
     // ─────────────────────────────────────────────────────────────────────────
-    private final DeviceOrientationListener fopListener = new DeviceOrientationListener() {
-        @SuppressLint("SetTextI18n")
-        @Override
-        public void onDeviceOrientationChanged(DeviceOrientation orientation) {
-            float headingError = orientation.getHeadingErrorDegrees();
-
-            if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
-                if (isCollectingMag) {
-                    runOnUiThread(() -> showStatus(
-                            String.format(Locale.US, "⚠️ Compass interference (Error: %.1f°).\nPlease move phone in a figure-8.", headingError)
-                    ));
+    private DeviceOrientationListener createFopListener(int generation) {
+        return new DeviceOrientationListener() {
+            @SuppressLint("SetTextI18n")
+            @Override
+            public void onDeviceOrientationChanged(DeviceOrientation orientation) {
+                if (!isFopRegistered || generation != activeFopGeneration) {
+                    return;
                 }
-                return;
-            }
 
-            float[] attitude = orientation.getAttitude();
-            if (attitude.length >= 4) {
-                float[] normalizedAttitude = normalizeQuaternionCopy(attitude);
-                if (normalizedAttitude != null) {
-                    long sampleElapsedRealtimeNs = orientation.getElapsedRealtimeNs();
-                    lastFopAttitude = normalizedAttitude.clone();
-                    lastFopElapsedRealtimeNs = sampleElapsedRealtimeNs;
-                    addFopAttitudeSample(sampleElapsedRealtimeNs, normalizedAttitude);
+                float headingError = orientation.getHeadingErrorDegrees();
+
+                if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
+                    if (isCollectingMag) {
+                        runOnUiThread(() -> showStatus(
+                                String.format(Locale.US, "⚠️ Compass interference (Error: %.1f°).\nPlease move phone in a figure-8.", headingError)
+                        ));
+                    }
+                    return;
                 }
-            }
 
-            runOnUiThread(() -> {
-                lastRawMagHeading = getCameraHeadingDegrees(orientation);
+                float[] attitude = orientation.getAttitude();
+                if (attitude.length >= 4) {
+                    float[] normalizedAttitude = normalizeQuaternionCopy(attitude);
+                    if (normalizedAttitude != null) {
+                        long sampleElapsedRealtimeNs = orientation.getElapsedRealtimeNs();
+                        lastFopSample = new TimedAttitude(sampleElapsedRealtimeNs, normalizedAttitude.clone());
+                        addFopAttitudeSample(sampleElapsedRealtimeNs, normalizedAttitude);
+                    }
+                }
 
-                if (isCollectingMag) {
-                    SamplingSession session = activeSamplingSession;
-                    if (!isSampling || session == null) {
-                        isCollectingMag = false;
+                runOnUiThread(() -> {
+                    if (!isFopRegistered || generation != activeFopGeneration) {
                         return;
                     }
 
-                    Frame frame = arSceneView.getFrame();
-                    if (frame == null || frame.getCamera().getTrackingState() != TrackingState.TRACKING)
-                        return;
+                    lastRawMagHeading = getCameraHeadingDegrees(orientation);
 
-                    // Camera-forward offset (used only for wall QR)
-                    double arYaw = getARCameraYawDegrees(frame);
-                    double targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0;
-
-                    magValidationBuffer.add(targetOffset);
-
-                    dbBadge.setText("🧭 Mag Samples: " + magValidationBuffer.size() + "/" + MAG_SAMPLES_REQUIRED);
-
-                    if (magValidationBuffer.size() >= MAG_SAMPLES_REQUIRED) {
-                        isCollectingMag = false;
-                        StringBuilder sb = new StringBuilder("\n===10 MAG SAMPLES CAPTURED ===\n");
-                        for (int i = 0; i < magValidationBuffer.size(); i++) {
-                            sb.append(String.format(Locale.US, "Mag Sample #%02d: %.2f°\n", i + 1, magValidationBuffer.get(i)));
+                    if (isCollectingMag) {
+                        SamplingSession session = activeSamplingSession;
+                        if (!isSampling || session == null) {
+                            isCollectingMag = false;
+                            return;
                         }
-                        Log.i(TAG, sb.toString());
 
-                        StringBuilder uiSb = new StringBuilder("🧲 10 MAG SAMPLES:\n");
-                        for (int i = 0; i < magValidationBuffer.size(); i++) {
-                            uiSb.append(String.format(Locale.US, "%5.1f°", magValidationBuffer.get(i)));
-                            if (i < magValidationBuffer.size() - 1) uiSb.append(", ");
-                            if ((i + 1) % 5 == 0 && i != magValidationBuffer.size() - 1) {
-                                uiSb.append("\n");
+                        Frame frame = arSceneView.getFrame();
+                        if (frame == null || frame.getCamera().getTrackingState() != TrackingState.TRACKING)
+                            return;
+
+                        // Camera-forward offset (used only for wall QR)
+                        double arYaw = getARCameraYawDegrees(frame);
+                        double targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0;
+
+                        magValidationBuffer.add(targetOffset);
+
+                        dbBadge.setText("🧭 Mag Samples: " + magValidationBuffer.size() + "/" + MAG_SAMPLES_REQUIRED);
+
+                        if (magValidationBuffer.size() >= MAG_SAMPLES_REQUIRED) {
+                            isCollectingMag = false;
+                            StringBuilder sb = new StringBuilder("\n===10 MAG SAMPLES CAPTURED ===\n");
+                            for (int i = 0; i < magValidationBuffer.size(); i++) {
+                                sb.append(String.format(Locale.US, "Mag Sample #%02d: %.2f°\n", i + 1, magValidationBuffer.get(i)));
                             }
+                            Log.i(TAG, sb.toString());
+
+                            StringBuilder uiSb = new StringBuilder("🧲 10 MAG SAMPLES:\n");
+                            for (int i = 0; i < magValidationBuffer.size(); i++) {
+                                uiSb.append(String.format(Locale.US, "%5.1f°", magValidationBuffer.get(i)));
+                                if (i < magValidationBuffer.size() - 1) uiSb.append(", ");
+                                if ((i + 1) % 5 == 0 && i != magValidationBuffer.size() - 1) {
+                                    uiSb.append("\n");
+                                }
+                            }
+                            magSamplesDisplay = uiSb.toString();
+
+                            List<Double> filteredMagSamples = filterCircularOutliers(magValidationBuffer);
+                            samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples);
+                            session.offsetAnchor = samplingOffsetAnchor;
+
+                            showStatus("📐 North locked. Measuring QR...");
+                            dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
+
+                            int rejectedSamples = magValidationBuffer.size() - filteredMagSamples.size();
+                            if (rejectedSamples > 0) {
+                                log(String.format(Locale.US,
+                                        "Filtered %d/%d magnetic outliers before averaging",
+                                        rejectedSamples, magValidationBuffer.size()));
+                            }
+                            log("Averaged " + filteredMagSamples.size() + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
                         }
-                        magSamplesDisplay = uiSb.toString();
-
-                        List<Double> filteredMagSamples = filterCircularOutliers(magValidationBuffer);
-                        samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples);
-                        session.offsetAnchor = samplingOffsetAnchor;
-
-                        showStatus("📐 North locked. Measuring QR...");
-                        dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
-
-                        int rejectedSamples = magValidationBuffer.size() - filteredMagSamples.size();
-                        if (rejectedSamples > 0) {
-                            log(String.format(Locale.US,
-                                    "Filtered %d/%d magnetic outliers before averaging",
-                                    rejectedSamples, magValidationBuffer.size()));
-                        }
-                        log("Averaged " + filteredMagSamples.size() + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
                     }
-                }
-            });
-        }
-    };
+                });
+            }
+        };
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Vector Math Helpers
@@ -495,8 +507,7 @@ public class MainActivity extends AppCompatActivity {
         synchronized (fopHistoryLock) {
             fopAttitudeHistory.clear();
         }
-        lastFopAttitude = null;
-        lastFopElapsedRealtimeNs = 0L;
+        lastFopSample = null;
     }
 
     private static float[] normalizeQuaternionCopy(float[] quaternion) {
@@ -633,13 +644,13 @@ public class MainActivity extends AppCompatActivity {
         resolved = resolveFopAttitudeAt(acquireElapsedRealtimeNs, "acquire");
         if (resolved != null) return resolved;
 
-        float[] latest = lastFopAttitude;
-        if (latest == null) return null;
+        TimedAttitude latestSample = lastFopSample;
+        if (latestSample == null) return null;
 
         return new ResolvedFopAttitude(
-                latest.clone(),
+                latestSample.attitude.clone(),
                 acquireElapsedRealtimeNs,
-                lastFopElapsedRealtimeNs,
+                latestSample.elapsedRealtimeNs,
                 "latest");
     }
 
@@ -750,6 +761,10 @@ public class MainActivity extends AppCompatActivity {
             log("FOP already started; skipping duplicate registration.");
             return;
         }
+        int generation = nextFopGeneration.getAndIncrement();
+        DeviceOrientationListener listener = createFopListener(generation);
+        activeFopGeneration = generation;
+        activeFopListener = listener;
         isFopRegistered = true;
 
         locationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
@@ -773,20 +788,32 @@ public class MainActivity extends AppCompatActivity {
         ).build();
 
         fusedOrientationClient
-                .requestOrientationUpdates(request, ensureFopExecutor(), fopListener)
-                .addOnSuccessListener(unused -> log("FOP: registration success"))
+                .requestOrientationUpdates(request, ensureFopExecutor(), listener)
+                .addOnSuccessListener(unused -> {
+                    if (generation == activeFopGeneration && listener == activeFopListener) {
+                        log("FOP: registration success");
+                    }
+                })
                 .addOnFailureListener(e -> {
-                    isFopRegistered = false;
+                    if (generation == activeFopGeneration && listener == activeFopListener) {
+                        isFopRegistered = false;
+                        activeFopGeneration = 0;
+                        activeFopListener = null;
+                        clearFopHistory();
+                    }
                     Log.e(TAG, "FOP: registration failed", e);
                     runOnUiThread(() -> dbBadge.setText("⚠️ FOP unavailable — check Play Services"));
                 });
     }
 
     private void stopFOP() {
-        if (fusedOrientationClient != null && isFopRegistered) {
-            fusedOrientationClient.removeOrientationUpdates(fopListener);
+        DeviceOrientationListener listener = activeFopListener;
+        if (fusedOrientationClient != null && listener != null) {
+            fusedOrientationClient.removeOrientationUpdates(listener);
         }
         isFopRegistered = false;
+        activeFopGeneration = 0;
+        activeFopListener = null;
         clearFopHistory();
     }
 
@@ -1194,6 +1221,12 @@ public class MainActivity extends AppCompatActivity {
                                        ResolvedFopAttitude resolvedFopAttitude,
                                        String framePayload) {
         SamplingSession session = activeSamplingSession;
+        if (session == null || !isSampling) return;
+
+        if (resolvedFopAttitude == null) {
+            log("[collectSampleWithPose] Waiting for aligned FOP before accepting samples");
+            return;
+        }
         if (!isSampling || session == null) {
             log("[collectSampleWithPose] No active sampling session - skipping frame");
             return;
@@ -1790,7 +1823,7 @@ public class MainActivity extends AppCompatActivity {
                 return wallFallback;
             }
 
-            log("[yawCalc] Wall QR detected, but solvePnP wall pose failed and VP fallback roll was unavailable. Dropping frame.");
+            log("[yawCalc] Wall QR detected, but solvePnP failed and no safe fallback was available. Dropping frame.");
             return null;
 
         } else {
@@ -1932,6 +1965,11 @@ public class MainActivity extends AppCompatActivity {
             return null;
         }
 
+        if (fopAttitude != null) {
+            log("[yawCalc] Wall solvePnP failed - skipping VP fallback because VP yaw is ARCore-relative, not FOP-aligned");
+            return null;
+        }
+
         float[] vpUpWorld = rotateCamToWorld(vpUpCam, camPose);
         double roll = computeWallRollDegrees(vpUpWorld, planeNormalWorld);
         if (Double.isNaN(roll)) {
@@ -1955,8 +1993,8 @@ public class MainActivity extends AppCompatActivity {
                 roll,
                 vpWallRawYaw,
                 alignedVpYaw,
-                fopAttitude != null ? "direct" : "legacy-offset"));
-        return new QRMeasurement(finalYaw, pitch, roll, 0.8, "wall-vp-direct", true);
+                "legacy-offset"));
+        return new QRMeasurement(finalYaw, pitch, roll, 0.8, "wall-vp", true);
     }
 
     private float[] computeWallVpUpVectorInCamera(
@@ -2012,6 +2050,47 @@ public class MainActivity extends AppCompatActivity {
             corners.add(new float[]{points[i * 2], points[i * 2 + 1]});
         }
         return corners;
+    }
+
+    private float[] captureImageToViewBasis(Frame frame, int imageWidth, int imageHeight) {
+        float[] srcBasis = new float[]{
+                0f, 0f,
+                (float) imageWidth, 0f,
+                0f, (float) imageHeight
+        };
+        float[] dstBasis = new float[6];
+        try {
+            frame.transformCoordinates2d(
+                    com.google.ar.core.Coordinates2d.IMAGE_PIXELS, srcBasis,
+                    com.google.ar.core.Coordinates2d.VIEW, dstBasis
+            );
+            return dstBasis;
+        } catch (Exception e) {
+            Log.w(TAG, "captureImageToViewBasis failed", e);
+            return null;
+        }
+    }
+
+    private float[] mapImagePointsToView(float[] imagePoints, float[] viewBasis, int imageWidth, int imageHeight) {
+        if (viewBasis == null || imagePoints == null || imagePoints.length != 8 || imageWidth <= 0 || imageHeight <= 0) {
+            return null;
+        }
+
+        float originX = viewBasis[0];
+        float originY = viewBasis[1];
+        float basisXX = viewBasis[2] - originX;
+        float basisXY = viewBasis[3] - originY;
+        float basisYX = viewBasis[4] - originX;
+        float basisYY = viewBasis[5] - originY;
+
+        float[] viewPoints = new float[imagePoints.length];
+        for (int i = 0; i < imagePoints.length; i += 2) {
+            float u = imagePoints[i] / (float) imageWidth;
+            float v = imagePoints[i + 1] / (float) imageHeight;
+            viewPoints[i] = originX + basisXX * u + basisYX * v;
+            viewPoints[i + 1] = originY + basisXY * u + basisYY * v;
+        }
+        return viewPoints;
     }
 
     private float[] refineCornersSubPixel(Mat grayMat, float[] imagePoints) {
@@ -2088,15 +2167,15 @@ public class MainActivity extends AppCompatActivity {
 
     @OptIn(markerClass = ExperimentalGetImage.class)
     private void scanQrFromArFrame(Frame frame) {
+        android.media.Image cameraImage = null;
         try {
-            android.media.Image cameraImage = frame.acquireCameraImage();
+            cameraImage = frame.acquireCameraImage();
             final long capturedImageTimestampNs = cameraImage.getTimestamp();
             final long capturedAcquireElapsedRealtimeNs = SystemClock.elapsedRealtimeNanos();
 
             CameraIntrinsics capturedIntrinsics = frame.getCamera().getImageIntrinsics();
             float[] capturedPose = new float[16];
             frame.getCamera().getPose().toMatrix(capturedPose, 0);
-            final Frame capturedFrame = frame;
 
             // 1. Extract Grayscale (Y) plane SAFELY (Strips hardware padding)
             android.media.Image.Plane yPlane = cameraImage.getPlanes()[0];
@@ -2104,6 +2183,7 @@ public class MainActivity extends AppCompatActivity {
             int yRowStride = yPlane.getRowStride();
             int width = cameraImage.getWidth();
             int height = cameraImage.getHeight();
+            final float[] capturedImageToViewBasis = captureImageToViewBasis(frame, width, height);
 
             byte[] yData = new byte[width * height];
 
@@ -2120,16 +2200,15 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            cameraImage.close(); // Close immediately to free ARCore
-
             // 2. Offload to background thread
             qrExecutor.execute(() -> {
+                org.opencv.core.Mat grayMat = null;
+                List<org.opencv.core.Mat> points = new ArrayList<>();
                 try {
                     // Initialize Mat with the perfectly sized byte array
-                    org.opencv.core.Mat grayMat = new org.opencv.core.Mat(height, width, org.opencv.core.CvType.CV_8UC1);
+                    grayMat = new org.opencv.core.Mat(height, width, org.opencv.core.CvType.CV_8UC1);
                     grayMat.put(0, 0, yData);
 
-                    List<org.opencv.core.Mat> points = new ArrayList<>();
                     List<String> results = com.king.wechat.qrcode.WeChatQRCodeDetector.detectAndDecode(grayMat, points);
 
                     // --- QR LOST LOGIC ---
@@ -2147,8 +2226,6 @@ public class MainActivity extends AppCompatActivity {
                             });
                         }
 
-                        // Release C++ memory
-                        grayMat.release();
                         return; // Jumps to 'finally' block
                     }
 
@@ -2170,21 +2247,12 @@ public class MainActivity extends AppCompatActivity {
                     };
                     final float[] imagePoints = refineCornersSubPixel(grayMat, detectorImagePoints);
 
-                    // Project to AR View for overlay
-                    float[] viewPoints = new float[8];
-                    try {
-                        capturedFrame.transformCoordinates2d(
-                                com.google.ar.core.Coordinates2d.IMAGE_PIXELS, imagePoints,
-                                com.google.ar.core.Coordinates2d.VIEW, viewPoints
-                        );
-                    } catch (Exception e) {
-                        Log.w(TAG, "transformCoordinates2d failed", e);
-                        grayMat.release();
-                        cornersMat.release();
-                        return; // Jumps to 'finally' block
-                    }
+                    float[] viewPoints = mapImagePointsToView(imagePoints, capturedImageToViewBasis, width, height);
+                    List<float[]> cornersList = viewPoints != null ? toCornerList(viewPoints) : null;
 
-                    List<float[]> cornersList = toCornerList(viewPoints);
+                    final ResolvedFopAttitude resolvedFop = isSampling && !isCollectingMag
+                            ? resolveFopAttitudeForFrame(capturedImageTimestampNs, capturedAcquireElapsedRealtimeNs)
+                            : null;
 
                     runOnUiThread(() -> {
                         lastDetectedCorners = cornersList;
@@ -2192,26 +2260,16 @@ public class MainActivity extends AppCompatActivity {
                         onQRPayloadDetected(payload);
 
                         if (isSampling && !isCollectingMag) {
-                            ResolvedFopAttitude resolvedFopAttitude = resolveFopAttitudeForFrame(
-                                    capturedImageTimestampNs,
-                                    capturedAcquireElapsedRealtimeNs);
-                            collectSampleWithPose(
-                                    imagePoints,
-                                    capturedPose,
-                                    capturedIntrinsics,
-                                    resolvedFopAttitude,
-                                    payload);
+                            collectSampleWithPose(imagePoints, capturedPose, capturedIntrinsics, resolvedFop, payload);
                         }
                     });
-
-                    // Free C++ Memory
-                    grayMat.release();
-                    for (org.opencv.core.Mat m : points) m.release();
 
                 } catch (Exception e) {
                     // If anything inside the thread crashes, log it here!
                     Log.e(TAG, "FATAL ERROR inside QR Executor thread!", e);
                 } finally {
+                    if (grayMat != null) grayMat.release();
+                    for (org.opencv.core.Mat m : points) m.release();
                     // 🚨 GUARANTEES THE APP NEVER DEADLOCKS 🚨
                     isProcessingFrame.set(false);
                 }
@@ -2220,6 +2278,14 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             isProcessingFrame.set(false);
             Log.w(TAG, "scanQrFromArFrame outer error: " + e.getMessage());
+        } finally {
+            if (cameraImage != null) {
+                try {
+                    cameraImage.close();
+                } catch (Exception closeError) {
+                    Log.w(TAG, "cameraImage.close failed", closeError);
+                }
+            }
         }
     }
 
@@ -2391,7 +2457,15 @@ public class MainActivity extends AppCompatActivity {
             CameraIntrinsics intrinsics,
             float[] camPose,
             float[] fopAttitude) {
-
+        Mat cameraMatrix = null;
+        MatOfDouble distCoeffs = null;
+        MatOfPoint3f objectPoints = null;
+        MatOfPoint2f imagePts = null;
+        Mat pnpAux1 = null;
+        Mat pnpAux2 = null;
+        Mat pnpAux3 = null;
+        List<Mat> rvecs = new ArrayList<>();
+        List<Mat> tvecs = new ArrayList<>();
         try {
             float[] focal = intrinsics.getFocalLength();
             float[] pp = intrinsics.getPrincipalPoint();
@@ -2401,39 +2475,40 @@ public class MainActivity extends AppCompatActivity {
             double cx = pp[0];
             double cy = pp[1];
 
-            Mat cameraMatrix = new Mat(3, 3, CvType.CV_64F);
+            cameraMatrix = new Mat(3, 3, CvType.CV_64F);
             cameraMatrix.put(0, 0,
                     fx, 0, cx,
                     0, fy, cy,
                     0, 0, 1);
 
-            MatOfDouble distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
+            distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
 
             double half = (float) 0.1 / 2.0;
 
             // IPPE_SQUARE expects points in this exact square coordinate order:
             // top-left, top-right, bottom-right, bottom-left in object space.
-            MatOfPoint3f objectPoints = new MatOfPoint3f(
+            objectPoints = new MatOfPoint3f(
                     new Point3(-half,  half, 0),
                     new Point3( half,  half, 0),
                     new Point3( half, -half, 0),
                     new Point3(-half, -half, 0)
             );
 
-            MatOfPoint2f imagePts = new MatOfPoint2f(
+            imagePts = new MatOfPoint2f(
                     new Point(imagePoints[0], imagePoints[1]),
                     new Point(imagePoints[2], imagePoints[3]),
                     new Point(imagePoints[4], imagePoints[5]),
                     new Point(imagePoints[6], imagePoints[7])
             );
 
-            List<Mat> rvecs = new ArrayList<>();
-            List<Mat> tvecs = new ArrayList<>();
+            pnpAux1 = new Mat();
+            pnpAux2 = new Mat();
+            pnpAux3 = new Mat();
 
             int numSolutions = Calib3d.solvePnPGeneric(
                     objectPoints, imagePts, cameraMatrix, distCoeffs,
                     rvecs, tvecs, false, Calib3d.SOLVEPNP_IPPE_SQUARE,
-                    new Mat(), new Mat(), new Mat()
+                    pnpAux1, pnpAux2, pnpAux3
             );
 
             if (numSolutions == 0) {
@@ -2451,99 +2526,96 @@ public class MainActivity extends AppCompatActivity {
 
             for (int solIdx = 0; solIdx < numSolutions; solIdx++) {
                 Mat rotationMatrix = new Mat();
-                Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix);
+                try {
+                    Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix);
 
-                // QR normal (Z column) in OpenCV camera space
-                double normalCamX = rotationMatrix.get(0, 2)[0];
-                double normalCamY = rotationMatrix.get(1, 2)[0];
-                double normalCamZ = rotationMatrix.get(2, 2)[0];
+                    // QR normal (Z column) in OpenCV camera space
+                    double normalCamX = rotationMatrix.get(0, 2)[0];
+                    double normalCamY = rotationMatrix.get(1, 2)[0];
+                    double normalCamZ = rotationMatrix.get(2, 2)[0];
 
-                // QR "up" (+Y column) in OpenCV camera space.
-                double upCamX = rotationMatrix.get(0, 1)[0];
-                double upCamY = rotationMatrix.get(1, 1)[0];
-                double upCamZ = rotationMatrix.get(2, 1)[0];
+                    // QR "up" (+Y column) in OpenCV camera space.
+                    double upCamX = rotationMatrix.get(0, 1)[0];
+                    double upCamY = rotationMatrix.get(1, 1)[0];
+                    double upCamZ = rotationMatrix.get(2, 1)[0];
 
-                // === VECTOR 1: ARCORE SENSOR FRAME ===
-                // Used strictly for ARCore to disambiguate the solvePnP pose
-                float[] upCamAndroid = new float[]{
-                        (float) upCamX,
-                        (float) -upCamY,
-                        (float) -upCamZ
-                };
-                float[] normalCamAndroid = new float[]{
-                        (float) normalCamX,
-                        (float) -normalCamY,
-                        (float) -normalCamZ
-                };
+                    // === VECTOR 1: ARCORE SENSOR FRAME ===
+                    // Used strictly for ARCore to disambiguate the solvePnP pose
+                    float[] upCamAndroid = new float[]{
+                            (float) upCamX,
+                            (float) -upCamY,
+                            (float) -upCamZ
+                    };
+                    float[] normalCamAndroid = new float[]{
+                            (float) normalCamX,
+                            (float) -normalCamY,
+                            (float) -normalCamZ
+                    };
 
-                // Transform to world space using ARCore pose (for disambiguation)
-                float[] uWorld = rotateCamToWorld(upCamAndroid, camPose);
-                float[] nWorld = rotateCamToWorld(normalCamAndroid, camPose);
+                    // Transform to world space using ARCore pose (for disambiguation)
+                    float[] uWorld = rotateCamToWorld(upCamAndroid, camPose);
+                    float[] nWorld = rotateCamToWorld(normalCamAndroid, camPose);
 
-                // Force normal to point UP away from floor
-                if (nWorld[1] < 0) {
-                    uWorld[0] = -uWorld[0];
-                    uWorld[1] = -uWorld[1];
-                    uWorld[2] = -uWorld[2];
-                }
-
-                double solPitch = Math.toDegrees(Math.asin(
-                        Math.max(-1.0, Math.min(1.0, nWorld[1]))));
-
-                // Select solution where "Up" is closest to horizontal
-                double score = Math.abs(uWorld[1]);
-                double reprojError = computeReprojectionRmse(
-                        objectPoints, imagePts, cameraMatrix, distCoeffs, rvecs.get(solIdx), tvecs.get(solIdx));
-
-                double solYaw;
-
-                if (useDirect) {
-                    // === VECTOR 2: DEVICE PORTRAIT FRAME ===
-                    // Used strictly for FOP absolute compass math
-                    float[] upCamDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ);
-
-                    float[] rotMatrix = new float[9];
-                    SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude);
-
-                    // Handle the normal flip using the aligned device frame vector
-                    // (We can safely rely on nWorld[1] here since ARCore disambiguated it correctly)
-                    float[] upCamFinal = upCamDevice;
-                    if (nWorld[1] < 0) {
-                        upCamFinal = new float[]{-upCamDevice[0], -upCamDevice[1], -upCamDevice[2]};
+                    // Force normal to point UP away from floor.
+                    boolean flippedForFloor = nWorld[1] < 0;
+                    if (flippedForFloor) {
+                        uWorld = vec3Scale(uWorld, -1f);
+                        nWorld = vec3Scale(nWorld, -1f);
                     }
 
-                    // 1. Apply FOP rotation to get absolute earth bearing
-                    float upEast = rotMatrix[0] * upCamFinal[0] + rotMatrix[1] * upCamFinal[1] + rotMatrix[2] * upCamFinal[2];
-                    float upNorth = rotMatrix[3] * upCamFinal[0] + rotMatrix[4] * upCamFinal[1] + rotMatrix[5] * upCamFinal[2];
+                    double solPitch = Math.toDegrees(Math.asin(
+                            Math.max(-1.0, Math.min(1.0, nWorld[1]))));
 
-                    // 2. Project onto horizontal plane via atan2 (ignores the Sky/Z vector to eliminate tilt bleed)
-                    solYaw = Math.toDegrees(Math.atan2(upEast, upNorth));
-                    if (solYaw < 0) solYaw += 360.0;
+                    // Select solution where "Up" is closest to horizontal
+                    double score = Math.abs(uWorld[1]);
+                    double reprojError = computeReprojectionRmse(
+                            objectPoints, imagePts, cameraMatrix, distCoeffs, rvecs.get(solIdx), tvecs.get(solIdx));
 
-                } else {
-                    // === FALLBACK: ARCore world path ===
-                    solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(uWorld[0], uWorld[2])));
+                    double solYaw;
+
+                    if (useDirect) {
+                        // === VECTOR 2: DEVICE PORTRAIT FRAME ===
+                        // Used strictly for FOP absolute compass math
+                        float[] upCamDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ);
+
+                        float[] rotMatrix = new float[9];
+                        SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude);
+
+                        float[] upCamFinal = upCamDevice;
+                        if (flippedForFloor) {
+                            upCamFinal = new float[]{-upCamDevice[0], -upCamDevice[1], -upCamDevice[2]};
+                        }
+
+                        // 1. Apply FOP rotation to get absolute earth bearing
+                        float upEast = rotMatrix[0] * upCamFinal[0] + rotMatrix[1] * upCamFinal[1] + rotMatrix[2] * upCamFinal[2];
+                        float upNorth = rotMatrix[3] * upCamFinal[0] + rotMatrix[4] * upCamFinal[1] + rotMatrix[5] * upCamFinal[2];
+
+                        // 2. Project onto horizontal plane via atan2 (ignores the Sky/Z vector to eliminate tilt bleed)
+                        solYaw = Math.toDegrees(Math.atan2(upEast, upNorth));
+                        if (solYaw < 0) solYaw += 360.0;
+
+                    } else {
+                        // === FALLBACK: ARCore world path ===
+                        solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(uWorld[0], uWorld[2])));
+                    }
+                    double solRoll = solYaw;
+
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestYaw = solYaw;
+                        bestPitch = solPitch;
+                        bestRoll = solRoll;
+                        bestReprojectionError = reprojError;
+                        bestSolutionIdx = solIdx;
+                    }
+
+                    Log.d(TAG, String.format(Locale.US,
+                            "[solvePnP] Solution %d: yaw=%.1f° pitch=%.1f° roll=%.1f° score=%.3f upWorld=(%.3f,%.3f,%.3f)",
+                            solIdx, solYaw, solPitch, solRoll, score, uWorld[0], uWorld[1], uWorld[2]));
+                } finally {
+                    rotationMatrix.release();
                 }
-                double solRoll = solYaw;
-
-                if (score < bestScore) {
-                    bestScore = score;
-                    bestYaw = solYaw;
-                    bestPitch = solPitch;
-                    bestRoll = solRoll;
-                    bestReprojectionError = reprojError;
-                    bestSolutionIdx = solIdx;
-                }
-
-                rotationMatrix.release();
-
-                Log.d(TAG, String.format(Locale.US,
-                        "[solvePnP] Solution %d: yaw=%.1f° pitch=%.1f° roll=%.1f° score=%.3f upWorld=(%.3f,%.3f,%.3f)",
-                        solIdx, solYaw, solPitch, solRoll, score, uWorld[0], uWorld[1], uWorld[2]));
             }
-
-            for (Mat r : rvecs) r.release();
-            for (Mat t : tvecs) t.release();
 
             // Use different method name so processSample knows to skip offset
             String method = useDirect ? "floor-solvepnp-direct" : "floor-solvepnp";
@@ -2558,6 +2630,16 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             log("[solvePnP] Exception: " + e.getMessage());
             return null;
+        } finally {
+            if (cameraMatrix != null) cameraMatrix.release();
+            if (distCoeffs != null) distCoeffs.release();
+            if (objectPoints != null) objectPoints.release();
+            if (imagePts != null) imagePts.release();
+            if (pnpAux1 != null) pnpAux1.release();
+            if (pnpAux2 != null) pnpAux2.release();
+            if (pnpAux3 != null) pnpAux3.release();
+            for (Mat r : rvecs) r.release();
+            for (Mat t : tvecs) t.release();
         }
     }
 
@@ -2596,7 +2678,15 @@ public class MainActivity extends AppCompatActivity {
             float[] vpNormalCam,
             double vpWallRawYaw,
             double vpWallNorthYaw) {
-
+        Mat cameraMatrix = null;
+        MatOfDouble distCoeffs = null;
+        MatOfPoint3f objectPoints = null;
+        MatOfPoint2f imagePts = null;
+        Mat pnpAux1 = null;
+        Mat pnpAux2 = null;
+        Mat pnpAux3 = null;
+        List<Mat> rvecs = new ArrayList<>();
+        List<Mat> tvecs = new ArrayList<>();
         try {
             float[] focal = intrinsics.getFocalLength();
             float[] pp = intrinsics.getPrincipalPoint();
@@ -2606,50 +2696,47 @@ public class MainActivity extends AppCompatActivity {
             double cx = pp[0];
             double cy = pp[1];
 
-            Mat cameraMatrix = new Mat(3, 3, CvType.CV_64F);
+            cameraMatrix = new Mat(3, 3, CvType.CV_64F);
             cameraMatrix.put(0, 0,
                     fx, 0, cx,
                     0, fy, cy,
                     0, 0, 1);
 
-            MatOfDouble distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
+            distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
             double half = (float) 0.1 / 2.0;
-            MatOfPoint3f objectPoints = new MatOfPoint3f(
+            objectPoints = new MatOfPoint3f(
                     new Point3(-half, half, 0),
                     new Point3(half, half, 0),
                     new Point3(half, -half, 0),
                     new Point3(-half, -half, 0)
             );
 
-            MatOfPoint2f imagePts = new MatOfPoint2f(
+            imagePts = new MatOfPoint2f(
                     new Point(imagePoints[0], imagePoints[1]),
                     new Point(imagePoints[2], imagePoints[3]),
                     new Point(imagePoints[4], imagePoints[5]),
                     new Point(imagePoints[6], imagePoints[7])
             );
 
-            List<Mat> rvecs = new ArrayList<>();
-            List<Mat> tvecs = new ArrayList<>();
+            pnpAux1 = new Mat();
+            pnpAux2 = new Mat();
+            pnpAux3 = new Mat();
 
             int numSolutions = Calib3d.solvePnPGeneric(
                     objectPoints, imagePts, cameraMatrix, distCoeffs,
                     rvecs, tvecs, false, Calib3d.SOLVEPNP_IPPE_SQUARE,
-                    new Mat(), new Mat(), new Mat()
+                    pnpAux1, pnpAux2, pnpAux3
             );
 
             if (numSolutions == 0) {
                 log("[wall-solvePnP] Failed - no solutions");
-                cameraMatrix.release();
-                distCoeffs.release();
-                objectPoints.release();
-                imagePts.release();
                 return null;
             }
 
             boolean useDirect = (fopAttitude != null);
-            float[] rotMatrix = new float[9];
+            float[] fopRotMatrix = new float[9];
             if (useDirect) {
-                SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude);
+                SensorManager.getRotationMatrixFromVector(fopRotMatrix, fopAttitude);
             }
             double continuityReferenceYaw = getWallContinuityReferenceYaw();
 
@@ -2680,24 +2767,36 @@ public class MainActivity extends AppCompatActivity {
                     double upCamY = rotationMatrix.get(1, 1)[0];
                     double upCamZ = rotationMatrix.get(2, 1)[0];
 
-                    float[] normalCamAndroid = new float[]{
-                            (float) normalCamX,
-                            (float) -normalCamY,
-                            (float) -normalCamZ
-                    };
-                    float[] upCamAndroid = new float[]{
-                            (float) upCamX,
-                            (float) -upCamY,
-                            (float) -upCamZ
-                    };
-                    float[] normalWorld = rotateCamToWorld(normalCamAndroid, camPose);
-                    float[] upWorld = rotateCamToWorld(upCamAndroid, camPose);
+                    // ── Step 1: Camera-space front-facing disambiguation ──
+                    // In OpenCV camera convention, Z points out of the camera.
+                    // A QR facing the camera has its normal pointing back toward
+                    // the camera, so normalCamZ must be negative.
+                    // This is purely geometric — no ARCore or FOP dependency.
+                    boolean frontFacing = normalCamZ < 0.0;
+                    if (!frontFacing) {
+                        normalCamX = -normalCamX;
+                        normalCamY = -normalCamY;
+                        normalCamZ = -normalCamZ;
+                        upCamX = -upCamX;
+                        upCamY = -upCamY;
+                        upCamZ = -upCamZ;
+                    }
 
                     double solYaw;
+                    double solPitch;
+                    double solRoll;
+
                     if (useDirect) {
+                        // ── Step 2: Map normal and up to device portrait frame ──
                         float[] normalDevice = mapOpenCvCameraVectorToDeviceFrame(normalCamX, normalCamY, normalCamZ);
-                        float normalEast = rotMatrix[0] * normalDevice[0] + rotMatrix[1] * normalDevice[1] + rotMatrix[2] * normalDevice[2];
-                        float normalNorth = rotMatrix[3] * normalDevice[0] + rotMatrix[4] * normalDevice[1] + rotMatrix[5] * normalDevice[2];
+                        float[] upDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ);
+
+                        // ── Step 3: Rotate normal to Earth frame via FOP ──
+                        // SensorManager rotation matrix rows:
+                        //   [0-2] = East,  [3-5] = North,  [6-8] = Up (gravity-opposite)
+                        float normalEast  = fopRotMatrix[0] * normalDevice[0] + fopRotMatrix[1] * normalDevice[1] + fopRotMatrix[2] * normalDevice[2];
+                        float normalNorth = fopRotMatrix[3] * normalDevice[0] + fopRotMatrix[4] * normalDevice[1] + fopRotMatrix[5] * normalDevice[2];
+                        float normalUp    = fopRotMatrix[6] * normalDevice[0] + fopRotMatrix[7] * normalDevice[1] + fopRotMatrix[8] * normalDevice[2];
 
                         double horizLenEarth = Math.hypot(normalEast, normalNorth);
                         if (horizLenEarth < 1e-5) {
@@ -2707,9 +2806,104 @@ public class MainActivity extends AppCompatActivity {
                             continue;
                         }
 
+                        // ── Step 4: Yaw and pitch entirely from FOP-rotated normal ──
                         solYaw = Math.toDegrees(Math.atan2(normalEast, normalNorth));
                         if (solYaw < 0) solYaw += 360.0;
+
+                        solPitch = Math.toDegrees(Math.atan2(normalUp, horizLenEarth));
+
+                        // ── Step 5: Viewpoint-invariant roll ──
+                        //
+                        // Roll = rotation of the QR's top edge relative to gravity's
+                        // projection onto the wall plane. This is a physical property
+                        // of the QR on the wall and is independent of camera position.
+                        //
+                        // Strategy:
+                        //   1. Project gravity-up onto the wall plane → wallRefUp
+                        //      (the direction "up" means on this particular wall surface)
+                        //   2. Rotate PnP up-vector to Earth frame, then project
+                        //      onto the same wall plane → qrUpOnWall
+                        //   3. Measure the signed angle between them in-plane
+
+                        float[] normalEarthVec = new float[]{ normalEast, normalNorth, normalUp };
+
+                        // Gravity-up in the FOP Earth frame is (East=0, North=0, Up=1)
+                        float[] gravityUp = new float[]{ 0f, 0f, 1f };
+
+                        // Project gravity-up onto the wall plane:
+                        //   projected = gravityUp - (gravityUp · normal) * normal
+                        float dotGravNormal = vec3Dot(gravityUp, normalEarthVec);
+                        float[] wallRefUp = new float[]{
+                                gravityUp[0] - dotGravNormal * normalEarthVec[0],
+                                gravityUp[1] - dotGravNormal * normalEarthVec[1],
+                                gravityUp[2] - dotGravNormal * normalEarthVec[2]
+                        };
+
+                        if (vec3Len(wallRefUp) < 1e-4f) {
+                            // Wall normal is pointing straight up/down — this is a
+                            // ceiling or floor, not a wall. Roll is undefined.
+                            log(String.format(Locale.US,
+                                    "[wall-solvePnP] Solution %d skipped - wall normal too vertical for roll (FOP path)",
+                                    solIdx));
+                            continue;
+                        }
+                        wallRefUp = vec3Normalize(wallRefUp);
+
+                        // Rotate the PnP up-vector to Earth frame via FOP
+                        float upEast  = fopRotMatrix[0] * upDevice[0] + fopRotMatrix[1] * upDevice[1] + fopRotMatrix[2] * upDevice[2];
+                        float upNorth = fopRotMatrix[3] * upDevice[0] + fopRotMatrix[4] * upDevice[1] + fopRotMatrix[5] * upDevice[2];
+                        float upUp    = fopRotMatrix[6] * upDevice[0] + fopRotMatrix[7] * upDevice[1] + fopRotMatrix[8] * upDevice[2];
+                        float[] qrUpEarth = new float[]{ upEast, upNorth, upUp };
+
+                        // Project QR up onto the same wall plane
+                        float dotQrNormal = vec3Dot(qrUpEarth, normalEarthVec);
+                        float[] qrUpOnWall = new float[]{
+                                qrUpEarth[0] - dotQrNormal * normalEarthVec[0],
+                                qrUpEarth[1] - dotQrNormal * normalEarthVec[1],
+                                qrUpEarth[2] - dotQrNormal * normalEarthVec[2]
+                        };
+
+                        if (vec3Len(qrUpOnWall) < 1e-4f) {
+                            // QR up-vector is parallel to wall normal — degenerate
+                            log(String.format(Locale.US,
+                                    "[wall-solvePnP] Solution %d skipped - QR up degenerate on wall plane (FOP path)",
+                                    solIdx));
+                            continue;
+                        }
+                        qrUpOnWall = vec3Normalize(qrUpOnWall);
+
+                        // Build an in-plane right axis: wallRefRight = normal × wallRefUp
+                        // This gives us a signed 2D coordinate system on the wall face.
+                        float[] wallRefRight = vec3Normalize(vec3Cross(normalEarthVec, wallRefUp));
+                        if (vec3Len(wallRefRight) < 1e-4f) {
+                            log(String.format(Locale.US,
+                                    "[wall-solvePnP] Solution %d skipped - wall right vector degenerate (FOP path)",
+                                    solIdx));
+                            continue;
+                        }
+
+                        // Signed angle from wallRefUp to qrUpOnWall, measured in-plane
+                        double cosRoll = vec3Dot(qrUpOnWall, wallRefUp);
+                        double sinRoll = vec3Dot(qrUpOnWall, wallRefRight);
+                        solRoll = normalizeDegrees(Math.toDegrees(Math.atan2(sinRoll, cosRoll)));
+
                     } else {
+                        // ── Legacy ARCore path (non-direct) ──
+                        // ARCore is acceptable here because this path does not claim
+                        // absolute north — it uses the mag anchor offset downstream.
+                        float[] normalCamAndroid = new float[]{
+                                (float) normalCamX,
+                                (float) -normalCamY,
+                                (float) -normalCamZ
+                        };
+                        float[] upCamAndroid = new float[]{
+                                (float) upCamX,
+                                (float) -upCamY,
+                                (float) -upCamZ
+                        };
+                        float[] normalWorld = rotateCamToWorld(normalCamAndroid, camPose);
+                        float[] upWorld = rotateCamToWorld(upCamAndroid, camPose);
+
                         double horizLenWorld = Math.hypot(normalWorld[0], normalWorld[2]);
                         if (horizLenWorld < 1e-5) {
                             log(String.format(Locale.US,
@@ -2717,17 +2911,17 @@ public class MainActivity extends AppCompatActivity {
                                     solIdx));
                             continue;
                         }
-                        solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(normalWorld[0], normalWorld[2])));
-                    }
 
-                    double solPitch = Math.toDegrees(Math.asin(
-                            Math.max(-1.0, Math.min(1.0, normalWorld[1]))));
-                    double solRoll = computeWallRollDegrees(upWorld, normalWorld);
-                    if (Double.isNaN(solRoll)) {
-                        log(String.format(Locale.US,
-                                "[wall-solvePnP] Solution %d skipped - roll unavailable",
-                                solIdx));
-                        continue;
+                        solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(normalWorld[0], normalWorld[2])));
+                        solPitch = Math.toDegrees(Math.asin(
+                                Math.max(-1.0, Math.min(1.0, normalWorld[1]))));
+                        solRoll = computeWallRollDegrees(upWorld, normalWorld);
+                        if (Double.isNaN(solRoll)) {
+                            log(String.format(Locale.US,
+                                    "[wall-solvePnP] Solution %d skipped - roll unavailable",
+                                    solIdx));
+                            continue;
+                        }
                     }
 
                     double reprojError = computeReprojectionRmse(
@@ -2739,7 +2933,10 @@ public class MainActivity extends AppCompatActivity {
                         continue;
                     }
 
-                    boolean frontFacing = normalCamZ < 0.0;
+                    // Facing penalty: camera-space check already resolved the flip
+                    // above, so frontFacing should always be true after the flip.
+                    // We still penalize the originally-back-facing solution mildly
+                    // because the flipped pose is geometrically less trustworthy.
                     double facingPenalty = frontFacing ? 0.0 : WALL_BACKFACING_PENALTY;
                     double continuityPenalty = Double.isNaN(continuityReferenceYaw)
                             ? 0.0
@@ -2779,13 +2976,6 @@ public class MainActivity extends AppCompatActivity {
                     rotationMatrix.release();
                 }
             }
-
-            cameraMatrix.release();
-            distCoeffs.release();
-            objectPoints.release();
-            imagePts.release();
-            for (Mat r : rvecs) r.release();
-            for (Mat t : tvecs) t.release();
 
             if (bestSolutionIdx < 0) {
                 log("[wall-solvePnP] No usable wall solutions");
@@ -2834,6 +3024,16 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             log("[wall-solvePnP] Exception: " + e.getMessage());
             return null;
+        } finally {
+            if (cameraMatrix != null) cameraMatrix.release();
+            if (distCoeffs != null) distCoeffs.release();
+            if (objectPoints != null) objectPoints.release();
+            if (imagePts != null) imagePts.release();
+            if (pnpAux1 != null) pnpAux1.release();
+            if (pnpAux2 != null) pnpAux2.release();
+            if (pnpAux3 != null) pnpAux3.release();
+            for (Mat r : rvecs) r.release();
+            for (Mat t : tvecs) t.release();
         }
     }
 
