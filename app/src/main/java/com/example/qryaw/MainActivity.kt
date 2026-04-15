@@ -1,7 +1,6 @@
 package com.example.qryaw
 
 import android.Manifest
-import android.util.Log
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -12,7 +11,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.view.ViewGroup
+import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +20,7 @@ import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.ExperimentalGetImage
 import androidx.core.content.ContextCompat
+import com.example.qryaw.databinding.ActivityMainBinding
 import com.google.android.gms.location.DeviceOrientation
 import com.google.android.gms.location.DeviceOrientationListener
 import com.google.android.gms.location.DeviceOrientationRequest
@@ -50,9 +51,9 @@ import org.opencv.core.Size
 import org.opencv.core.TermCriteria
 import org.opencv.imgproc.Imgproc
 import java.util.ArrayDeque
-import java.util.Collections
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Consumer
 import kotlin.math.abs
@@ -66,21 +67,15 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-class MainActivity : AppCompatActivity() {
-    // ── UI Components ──
-    private var arSceneView: ARSceneView? = null
-//    private var overlayView: QROverlayView? = null
-    private var blueBorder: QrBlueBorder? = null
-
-    // ── Timeout ──
+open class MainActivity : AppCompatActivity() {
+    private var isValidateMode = false
     private val timeoutHandler = Handler(Looper.getMainLooper())
     private val timeoutRunnable = Runnable {
         setResult(RESULT_CANCELED)
         finish()
     }
 
-    // ── Runtime State ──
-    private val magValidationBuffer: MutableList<Double?> = ArrayList<Double?>()
+    private val magValidationBuffer: MutableList<Double> = ArrayList()
     private var lastMeasurementMethod: String? = null
 
     @Volatile
@@ -98,9 +93,11 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile
     private var isSampling = false
+
     @Volatile
     private var committedPayload: String? = null
-    private val sampleBuffer: MutableList<YawSample> = ArrayList<YawSample>()
+    private val samplingLock = Any()
+    private val sampleBuffer: MutableList<YawSample> = ArrayList()
     private var lastSampleTime: Long = 0
 
     @Volatile
@@ -119,20 +116,13 @@ class MainActivity : AppCompatActivity() {
     private var fopExecutor: ExecutorService? = null
     private var isFopRegistered = false
     private val fopHistoryLock = Any()
-    private val fopAttitudeHistory: ArrayDeque<TimedAttitude> = ArrayDeque<TimedAttitude>()
-
-    // ── Services ──
+    private val fopAttitudeHistory: ArrayDeque<TimedAttitude> = ArrayDeque()
     private var fusedOrientationClient: FusedOrientationProviderClient? = null
 
     private enum class SamplingPurpose {
         REGISTER, VALIDATE
     }
 
-    private enum class OffsetMode {
-        RELATIVE, ABSOLUTE, UNKNOWN
-    }
-
-    // ── Inner Data Classes ──
     private class YawSample(
         val yaw: Double,
         val northYaw: Double,
@@ -155,10 +145,7 @@ class MainActivity : AppCompatActivity() {
     private class TimedAttitude(val elapsedRealtimeNs: Long, val attitude: FloatArray)
 
     private class ResolvedFopAttitude(
-        val attitude: FloatArray?,
-        val targetTimestampNs: Long,
-        val referenceTimestampNs: Long,
-        val strategy: String?
+        val attitude: FloatArray?
     )
 
     private class SamplingSession(
@@ -173,45 +160,11 @@ class MainActivity : AppCompatActivity() {
         var offsetAnchor: Double = Double.NaN
     }
 
-    private fun flushSensors() {
-        stopFOP()
-
-        resetAlignment()
-        lastPayload = null
-        resetSamplingState()
-        lastDetectedCorners = null
-        lastQrSeenTime = 0
-        isProcessingFrame.set(false)
-        clearFopHistory()
-
-        val parent = arSceneView!!.getParent() as ViewGroup
-        val index = parent.indexOfChild(arSceneView)
-        val params = arSceneView!!.getLayoutParams()
-
-        arSceneView!!.destroy()
-        parent.removeView(arSceneView)
-
-        arSceneView = ARSceneView(this)
-        parent.addView(arSceneView, index, params)
-
-        arSceneView!!.sessionConfiguration = { session: Session?, config: Config? ->
-            config!!.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL)
-            null
-        }
-//
-//        runOnUiThread {
-//            overlayView!!.setCorners(null)
-//        }
-
-        arSceneView!!.postDelayed({
-            checkArCoreAndStart()
-            startFOP()
-        }, 500)
-    }
+    lateinit var binding: ActivityMainBinding
     private val fopListener: DeviceOrientationListener = object : DeviceOrientationListener {
         @SuppressLint("SetTextI18n")
         override fun onDeviceOrientationChanged(orientation: DeviceOrientation) {
-            val headingError = orientation.getHeadingErrorDegrees()
+            val headingError = orientation.headingErrorDegrees
 
             if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
                 return
@@ -221,7 +174,7 @@ class MainActivity : AppCompatActivity() {
             if (attitude.size >= 4) {
                 val normalizedAttitude: FloatArray? = normalizeQuaternionCopy(attitude)
                 if (normalizedAttitude != null) {
-                    val sampleElapsedRealtimeNs = orientation.getElapsedRealtimeNs()
+                    val sampleElapsedRealtimeNs = orientation.elapsedRealtimeNs
                     lastFopAttitude = normalizedAttitude.clone()
                     lastFopElapsedRealtimeNs = sampleElapsedRealtimeNs
                     addFopAttitudeSample(sampleElapsedRealtimeNs, normalizedAttitude)
@@ -231,28 +184,33 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread(Runnable {
                 lastRawMagHeading = getCameraHeadingDegrees(orientation)
                 if (isCollectingMag) {
-                    val session = activeSamplingSession
-                    if (!isSampling || session == null) {
-                        isCollectingMag = false
-                        return@Runnable
-                    }
+                    synchronized(samplingLock) {
+                        val session = activeSamplingSession
+                        if (!isSampling || session == null) {
+                            isCollectingMag = false
+                            return@Runnable
+                        }
 
-                    val frame = arSceneView!!.frame
-                    if (frame == null || frame.getCamera()
-                            .getTrackingState() != TrackingState.TRACKING
-                    ) return@Runnable
+                        val frame = binding.arSceneView.frame
+                        if (frame == null || frame.getCamera()
+                                .getTrackingState() != TrackingState.TRACKING
+                        ) return@Runnable
 
-                    // Camera-forward offset (used only for wall QR)
-                    val arYaw = getARCameraYawDegrees(frame)
-                    val targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0
+                        val arYaw = getARCameraYawDegrees(frame)
+                        val targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0
 
-                    magValidationBuffer.add(targetOffset)
-
-                    if (magValidationBuffer.size >= MAG_SAMPLES_REQUIRED) {
-                        isCollectingMag = false
-                        val filteredMagSamples = filterCircularOutliers(magValidationBuffer)
-                        samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples)
-                        session.offsetAnchor = samplingOffsetAnchor
+                        magValidationBuffer.add(targetOffset)
+                        if (magValidationBuffer.size >= MAG_SAMPLES_REQUIRED) {
+                            isCollectingMag = false
+                            val filteredMagSamples = filterCircularOutliers(magValidationBuffer)
+                            samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples)
+                            if (samplingOffsetAnchor.isNaN()) {
+                                magValidationBuffer.clear()
+                                isCollectingMag = true
+                                return@Runnable
+                            }
+                            session.offsetAnchor = samplingOffsetAnchor
+                        }
                     }
                 }
             })
@@ -262,17 +220,17 @@ class MainActivity : AppCompatActivity() {
     private fun resolveBackCameraSensorOrientation(): Int {
         try {
             val cameraManager =
-                getSystemService<CameraManager?>(CameraManager::class.java) ?: return 90
+                getSystemService(CameraManager::class.java) ?: return 90
 
             for (cameraId in cameraManager.cameraIdList) {
                 val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-                val lensFacing = characteristics.get<Int?>(CameraCharacteristics.LENS_FACING)
+                val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
                 if (lensFacing == null || lensFacing != CameraCharacteristics.LENS_FACING_BACK) {
                     continue
                 }
 
                 val sensorOrientation =
-                    characteristics.get<Int?>(CameraCharacteristics.SENSOR_ORIENTATION)
+                    characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION)
                 if (sensorOrientation != null) {
                     return sensorOrientation
                 }
@@ -349,7 +307,6 @@ class MainActivity : AppCompatActivity() {
             if (fopAttitudeHistory.isEmpty()) return null
             var prev: TimedAttitude? = null
             var next: TimedAttitude? = null
-
             for (sample in fopAttitudeHistory) {
                 if (sample.elapsedRealtimeNs <= targetTimestampNs) {
                     prev = sample
@@ -364,32 +321,21 @@ class MainActivity : AppCompatActivity() {
                 if (prev.elapsedRealtimeNs == next.elapsedRealtimeNs) {
                     val deltaNs = abs(targetTimestampNs - prev.elapsedRealtimeNs)
                     if (deltaNs <= MAX_FOP_NEAREST_SAMPLE_AGE_NS) {
-                        return ResolvedFopAttitude(
-                            prev.attitude.clone(),
-                            targetTimestampNs,
-                            prev.elapsedRealtimeNs,
-                            strategyBase + "-exact"
-                        )
+                        return ResolvedFopAttitude(prev.attitude.clone())
                     }
                 } else {
                     val spanNs = next.elapsedRealtimeNs - prev.elapsedRealtimeNs
-                    if (spanNs > 0 && spanNs <= MAX_FOP_INTERPOLATION_SPAN_NS) {
+                    if (spanNs in 1..MAX_FOP_INTERPOLATION_SPAN_NS) {
                         val alpha =
                             (targetTimestampNs - prev.elapsedRealtimeNs).toDouble() / spanNs.toDouble()
                         val interpolated: FloatArray? =
                             slerpQuaternion(prev.attitude, next.attitude, alpha)
                         if (interpolated != null) {
-                            return ResolvedFopAttitude(
-                                interpolated,
-                                targetTimestampNs,
-                                targetTimestampNs,
-                                strategyBase + "-interp"
-                            )
+                            return ResolvedFopAttitude(interpolated)
                         }
                     }
                 }
             }
-
             var nearest: TimedAttitude? = null
             var nearestDeltaNs = Long.MAX_VALUE
             if (prev != null) {
@@ -403,14 +349,8 @@ class MainActivity : AppCompatActivity() {
                     nearestDeltaNs = nextDeltaNs
                 }
             }
-
             if (nearest != null && nearestDeltaNs <= MAX_FOP_NEAREST_SAMPLE_AGE_NS) {
-                return ResolvedFopAttitude(
-                    nearest.attitude.clone(),
-                    targetTimestampNs,
-                    nearest.elapsedRealtimeNs,
-                    "$strategyBase-nearest"
-                )
+                return ResolvedFopAttitude(nearest.attitude.clone())
             }
             return null
         }
@@ -422,22 +362,13 @@ class MainActivity : AppCompatActivity() {
     ): ResolvedFopAttitude? {
         var resolved = resolveFopAttitudeAt(imageTimestampNs, "image")
         if (resolved != null) return resolved
-
         resolved = resolveFopAttitudeAt(acquireElapsedRealtimeNs, "acquire")
         if (resolved != null) return resolved
-
-        val latest = lastFopAttitude
-        if (latest == null) return null
-
-        return ResolvedFopAttitude(
-            latest.clone(),
-            acquireElapsedRealtimeNs,
-            lastFopElapsedRealtimeNs,
-            "latest"
-        )
+        val latest = lastFopAttitude ?: return null
+        return ResolvedFopAttitude(latest.clone())
     }
 
-    private val permissionLauncher: ActivityResultLauncher<Array<String?>> =
+    private val permissionLauncher: ActivityResultLauncher<Array<String>> =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val cameraGranted = permissions.getOrDefault(Manifest.permission.CAMERA, false)
             if (cameraGranted) {
@@ -447,41 +378,36 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
                 finish()
             }
-        } as ActivityResultLauncher<Array<String?>>
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
         timeoutHandler.postDelayed(timeoutRunnable, 15_000L)
-
-        arSceneView = findViewById(R.id.ar_scene_view)
-//        overlayView = findViewById(R.id.overlay_view)
-        blueBorder = findViewById(R.id.blue_border)
-//        statusText = findViewById(R.id.status_text)
-
+        isValidateMode = intent.getBooleanExtra("validate_mode", false)
+        if (isValidateMode) binding.blueBorder.visibility = View.GONE
         OpenCV.initOpenCV()
         WeChatQRCodeDetector.init(this)
         backCameraSensorOrientationDegrees = resolveBackCameraSensorOrientation()
-
         fusedOrientationClient = LocationServices.getFusedOrientationProviderClient(this)
-
-        arSceneView!!.sessionConfiguration = { _: Session?, config: Config? ->
+        binding.arSceneView.sessionConfiguration = { _: Session?, config: Config? ->
             config!!.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL)
-            null
         }
 
         resetSamplingState()
-
         val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
                 PackageManager.PERMISSION_GRANTED
         if (hasCamera) {
             checkArCoreAndStart()
         } else {
-            permissionLauncher.launch(arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ))
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
         }
     }
 
@@ -502,37 +428,43 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         timeoutHandler.removeCallbacks(timeoutRunnable)
+        resetSamplingState()
         stopFOP()
         qrExecutor.shutdownNow()
         if (fopExecutor != null) {
             fopExecutor!!.shutdownNow()
             fopExecutor = null
         }
+        binding.arSceneView.destroy()
         super.onDestroy()
     }
 
-    private fun ensureFopExecutor(): ExecutorService? {
-        if (fopExecutor == null || fopExecutor!!.isShutdown()) {
-            fopExecutor = Executors.newSingleThreadExecutor()
-        }
-        return fopExecutor
+    private fun ensureFopExecutor(): ExecutorService {
+        val existing = fopExecutor
+        if (existing != null && !existing.isShutdown) return existing
+        val newExecutor = Executors.newSingleThreadExecutor()
+        fopExecutor = newExecutor
+        return newExecutor
     }
 
-    @SuppressLint("MissingPermission")
     private fun startFOP() {
         if (fusedOrientationClient == null || isFopRegistered) return
         isFopRegistered = true
 
-        val request = DeviceOrientationRequest.Builder(DeviceOrientationRequest.OUTPUT_PERIOD_FAST).build()
+        val request =
+            DeviceOrientationRequest.Builder(DeviceOrientationRequest.OUTPUT_PERIOD_FAST).build()
         fusedOrientationClient!!
-            .requestOrientationUpdates(request, ensureFopExecutor()!!, fopListener)
+            .requestOrientationUpdates(request, ensureFopExecutor(), fopListener)
             .addOnSuccessListener(OnSuccessListener { _: Void? -> })
-            .addOnFailureListener(OnFailureListener { _: Exception? -> isFopRegistered = false })
+            .addOnFailureListener { _: Exception? -> isFopRegistered = false }
     }
 
     private fun stopFOP() {
         if (fusedOrientationClient != null && isFopRegistered) {
-            fusedOrientationClient!!.removeOrientationUpdates(fopListener)
+            try {
+                fusedOrientationClient!!.removeOrientationUpdates(fopListener)
+            } catch (_: Exception) {
+            }
         }
         isFopRegistered = false
         clearFopHistory()
@@ -540,7 +472,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun resetAlignment() {
         samplingOffsetAnchor = Double.NaN
-        lastRawMagHeading = 0.0
+        lastRawMagHeading = Double.NaN
         clearFopHistory()
     }
 
@@ -548,7 +480,7 @@ class MainActivity : AppCompatActivity() {
         ArCoreApk.getInstance()
             .checkAvailabilityAsync(this, Consumer { availability: Availability? ->
                 if (availability!!.isTransient()) {
-                    arSceneView!!.postDelayed({ checkArCoreAndStart() }, 200)
+                    binding.arSceneView.postDelayed({ checkArCoreAndStart() }, 200)
                     return@Consumer
                 }
                 if (availability.isSupported()) {
@@ -560,17 +492,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun initializeArSession() {
         try {
-            arSceneView!!.planeRenderer.isEnabled = false
+            binding.arSceneView.planeRenderer.isEnabled = false
         } catch (e: Exception) {
         }
     }
 
     private fun startArSession() {
         resetAlignment()
-        arSceneView!!.onFrame = label@{ frameTime: Long? ->
-            val frame = arSceneView!!.frame
-            if (frame == null) return@label Unit
-
+        val sceneView = binding.arSceneView
+        sceneView.onFrame = label@{ _: Long? ->
+            val frame = sceneView.frame ?: return@label Unit
             if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
                 processARFrame(frame)
             }
@@ -579,23 +510,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onQRPayloadDetected(payload: String) {
-        Log.d("test", "onQRPayloadDetected: payload=$payload isSampling=$isSampling")
         if (isFinishing) return
-        val session = activeSamplingSession
-        if (session != null && payload != session.payload) {
-            Log.d("test", "onQRPayloadDetected: QR changed, aborting: old=${session.payload} new=$payload")
-            abortActiveSampling("QR changed during sampling. Try again.")
+        synchronized(samplingLock) {
+            val session = activeSamplingSession
+            if (session != null && payload != session.payload) {
+                abortActiveSamplingLocked("QR changed during sampling. Try again.")
+            }
+            if (isSampling) return
+            if (payload == committedPayload) return
+            lastPayload = payload
         }
-        if (isSampling) return
-        if (payload == committedPayload) return
-        lastPayload = payload
-        startSampling(SamplingPurpose.REGISTER, payload)
+        startSampling(
+            if (isValidateMode) SamplingPurpose.VALIDATE else SamplingPurpose.REGISTER,
+            payload
+        )
     }
-
-    private val isAlignmentReady: Boolean
-        get() = !lastRawMagHeading.isNaN()
-
-
 
     private val offsetPreferences: SharedPreferences
         get() = getSharedPreferences(
@@ -607,10 +536,6 @@ class MainActivity : AppCompatActivity() {
         return OFFSET_KEY_PREFIX + payload
     }
 
-    private fun offsetModeKey(payload: String): String {
-        return OFFSET_MODE_KEY_PREFIX + payload
-    }
-
     private fun readStoredRelativeOffset(payload: String?): Double? {
         if (payload == null) return null
         val prefs = this.offsetPreferences
@@ -619,27 +544,6 @@ class MainActivity : AppCompatActivity() {
 
         val offset = prefs.getFloat(key, Float.NaN)
         return if (offset.isNaN()) null else offset.toDouble()
-    }
-
-    private fun persistOffsetMetadata(
-        payload: String?,
-        isAbsoluteNorth: Boolean,
-        offsetUsed: Double
-    ) {
-        if (payload == null) return
-
-        val editor = this.offsetPreferences.edit()
-            .putString(
-                offsetModeKey(payload),
-                if (isAbsoluteNorth) OffsetMode.ABSOLUTE.name else OffsetMode.RELATIVE.name
-            )
-
-        if (isAbsoluteNorth || offsetUsed.isNaN()) {
-            editor.remove(offsetKey(payload))
-        } else {
-            editor.putFloat(offsetKey(payload), offsetUsed.toFloat())
-        }
-        editor.apply()
     }
 
     private fun normalizeMeasurementFamily(method: String?): String {
@@ -663,6 +567,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resetSamplingState() {
+        synchronized(samplingLock) {
+            resetSamplingStateLocked()
+        }
+    }
+
+    private fun resetSamplingStateLocked() {
         sampleBuffer.clear()
         magValidationBuffer.clear()
         lastMeasurementMethod = null
@@ -671,13 +581,20 @@ class MainActivity : AppCompatActivity() {
         activeSamplingSession = null
         isSampling = false
         isCollectingMag = false
+        committedPayload = null
     }
 
     private fun abortActiveSampling(reason: String?) {
+        synchronized(samplingLock) {
+            abortActiveSamplingLocked(reason)
+        }
+    }
+
+    private fun abortActiveSamplingLocked(reason: String?) {
         if (!isSampling && activeSamplingSession == null && sampleBuffer.isEmpty() && magValidationBuffer.isEmpty()) {
             return
         }
-        resetSamplingState()
+        resetSamplingStateLocked()
     }
 
     private fun startSampling(p: SamplingPurpose?, payloadSnapshot: String?) {
@@ -685,16 +602,17 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        resetSamplingState()
-        activeSamplingSession = SamplingSession(
-            nextSamplingSessionId++,
-            payloadSnapshot,
-            p,
-            System.currentTimeMillis()
-        )
-        isSampling = true
-        isCollectingMag = true
-        Log.d("test", "startSampling: purpose=$p payload=$payloadSnapshot")
+        synchronized(samplingLock) {
+            resetSamplingStateLocked()
+            activeSamplingSession = SamplingSession(
+                nextSamplingSessionId++,
+                payloadSnapshot,
+                p,
+                System.currentTimeMillis()
+            )
+            isSampling = true
+            isCollectingMag = true
+        }
 
         val action = if (p == SamplingPurpose.REGISTER) "Registering" else "Validating"
     }
@@ -705,159 +623,149 @@ class MainActivity : AppCompatActivity() {
         resolvedFopAttitude: ResolvedFopAttitude?,
         framePayload: String?
     ) {
-        val session = activeSamplingSession
-        Log.d("test", "collectSampleWithPose: isSampling=$isSampling session=${session?.payload} framePayload=$framePayload fopAttitude=${resolvedFopAttitude?.attitude != null}")
-        if (!isSampling || session == null) {
-            Log.d("test", "collectSampleWithPose: skipped – not sampling or no session")
-            return
+        val session: SamplingSession?
+        synchronized(samplingLock) {
+            session = activeSamplingSession
+            if (!isSampling || session == null) {
+                return
+            }
+            if (session.payload != framePayload) {
+                return
+            }
         }
-        if (session.payload != framePayload) {
-            Log.d("test", "collectSampleWithPose: skipped – payload mismatch")
-            return
-        }
+
         val result = computeQRYawFromTopEdgeWithPose(
             imagePoints,
             camPose,
             intrinsics,
             resolvedFopAttitude?.attitude
         )
-        Log.d("test", "computeQRYaw result: yaw=${result?.yaw} pitch=${result?.pitch} roll=${result?.roll} method=${result?.method}")
-
         if (result == null) {
-            Log.d("test", "collectSampleWithPose: computeQRYaw returned null")
             return
         }
         processSample(result)
     }
 
     private fun processSample(result: QRMeasurement) {
-        val session = activeSamplingSession
-        if (!isSampling || session == null) {
-            return
-        }
-
-        var sampleConfidence = result.confidence
-        if (isWallDirectMethod(result.method) && sampleBuffer.size < WALL_EARLY_SAMPLE_CAP_COUNT) {
-            val cappedConfidence = min(sampleConfidence, WALL_EARLY_SAMPLE_CONFIDENCE_CAP)
-            if (cappedConfidence < sampleConfidence) {
-                sampleConfidence = cappedConfidence
+        synchronized(samplingLock) {
+            val session = activeSamplingSession
+            if (!isSampling || session == null) {
+                return
             }
-        }
 
-        if (sampleConfidence < MIN_SAMPLE_WEIGHT) {
-            return
-        }
-
-        if (result.roll.isNaN()) {
-            return
-        }
-
-        val sampleAbsoluteNorth = isAbsoluteNorthMethod(result.method)
-        val sampleMethodFamily = normalizeMeasurementFamily(result.method)
-        if (session.lockedMethod == null) {
-            session.lockedMethod = result.method
-            session.lockedMethodFamily = sampleMethodFamily
-            session.absoluteNorth = sampleAbsoluteNorth
-            lastMeasurementMethod = result.method
-        } else if ((sampleMethodFamily != session.lockedMethodFamily) || session.absoluteNorth == null || session.absoluteNorth != sampleAbsoluteNorth) {
-            return
-        }
-
-        val isAbsoluteNorth = session.absoluteNorth == true
-        val activeOffset = resolveActiveOffsetAnchor(session)
-
-        var sampleNorth: Double
-        if (isAbsoluteNorth) {
-            sampleNorth = result.yaw
-        } else {
-            if (activeOffset.isNaN()) {
-                sampleNorth = result.yaw
-            } else {
-                sampleNorth = (result.yaw + activeOffset) % 360.0
-                if (sampleNorth < 0) sampleNorth += 360.0
-            }
-        }
-
-        val sampleRoll: Double
-        if (result.rollAbsolute) {
-            sampleRoll = normalizeDegrees(result.roll)
-        } else {
-            sampleRoll = if (activeOffset.isNaN())
-                normalizeDegrees(result.roll)
-            else
-                normalizeDegrees(result.roll + activeOffset)
-        }
-
-        if (!sampleBuffer.isEmpty()) {
-            val yawReference = if (isAbsoluteNorth)
-                circularWeightedMeanNorth(sampleBuffer)
-            else
-                circularWeightedMeanRaw(sampleBuffer)
-            val yawCompareValue = if (isAbsoluteNorth) sampleNorth else result.yaw
-            val yawDiff = abs(angleDifference(yawReference, yawCompareValue))
-            val rollReference = circularWeightedMeanRoll(sampleBuffer)
-            val rollDiff = abs(angleDifference(rollReference, sampleRoll))
-            val pitchReference = weightedMeanPitch(sampleBuffer)
-            val pitchDiff = abs(pitchReference - result.pitch)
-            val outlierThreshold = if (isAbsoluteNorth)
-                DIRECT_METHOD_OUTLIER_THRESHOLD_DEG
-            else
-                45.0
-
-            if (yawDiff > outlierThreshold || rollDiff > outlierThreshold || pitchDiff > PITCH_OUTLIER_THRESHOLD_DEG) {
-                Log.w("test", "processSample: outlier yawDiff=$yawDiff rollDiff=$rollDiff pitchDiff=$pitchDiff (thresholds: yaw/roll=$outlierThreshold pitch=$PITCH_OUTLIER_THRESHOLD_DEG)")
-                if (sampleConfidence >= DIRECT_SAMPLE_RESET_CONFIDENCE
-                    && sampleBuffer.get(0).weight < 0.5
-                ) {
-                    Log.w("test", "processSample: high-confidence outlier — clearing buffer")
-                    sampleBuffer.clear()
-                } else {
-                    return
+            var sampleConfidence = result.confidence
+            if (isWallDirectMethod(result.method) && sampleBuffer.size < WALL_EARLY_SAMPLE_CAP_COUNT) {
+                val cappedConfidence = min(sampleConfidence, WALL_EARLY_SAMPLE_CONFIDENCE_CAP)
+                if (cappedConfidence < sampleConfidence) {
+                    sampleConfidence = cappedConfidence
                 }
             }
-        }
-
-        val now = System.currentTimeMillis()
-        if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
-            Log.w("test", "processSample: sample gap ${now - lastSampleTime}ms > ${MAX_SAMPLE_GAP_MS}ms — buffer cleared (had ${sampleBuffer.size} samples)")
-            sampleBuffer.clear()
-        }
-        lastSampleTime = now
-
-        sampleBuffer.add(
-            YawSample(
-                result.yaw,
-                sampleNorth,
-                result.pitch,
-                sampleRoll,
-                sampleConfidence
-            )
-        )
-
-        Log.d("test", "processSample: sample added buffer=${sampleBuffer.size}/$REQUIRED_SAMPLES  yaw=$sampleNorth  pitch=${result.pitch}  roll=$sampleRoll")
-        if (sampleBuffer.size >= REQUIRED_SAMPLES) {
-            isSampling = false
-
-            val finalYaw: Double
-            if (isAbsoluteNorth) {
-                finalYaw = circularWeightedMeanNorth(sampleBuffer)
-            } else {
-                finalYaw = circularWeightedMeanRaw(sampleBuffer)
+            if (sampleConfidence < MIN_SAMPLE_WEIGHT) {
+                return
             }
-            val finalPitch = weightedMeanPitch(sampleBuffer)
-            val finalRoll = circularWeightedMeanRoll(sampleBuffer)
+            if (result.roll.isNaN()) {
+                return
+            }
+            val sampleAbsoluteNorth = isAbsoluteNorthMethod(result.method)
+            val sampleMethodFamily = normalizeMeasurementFamily(result.method)
+            if (session.lockedMethod == null) {
+                session.lockedMethod = result.method
+                session.lockedMethodFamily = sampleMethodFamily
+                session.absoluteNorth = sampleAbsoluteNorth
+                lastMeasurementMethod = result.method
+            } else if ((sampleMethodFamily != session.lockedMethodFamily) || session.absoluteNorth == null || session.absoluteNorth != sampleAbsoluteNorth) {
+                return
+            }
 
-            sampleBuffer.clear()
-            commitReading(session, finalYaw, finalPitch, finalRoll)
+            val isAbsoluteNorth = session.absoluteNorth == true
+            val activeOffset = resolveActiveOffsetAnchor(session)
+
+            var sampleNorth: Double
+            if (isAbsoluteNorth) {
+                sampleNorth = result.yaw
+            } else {
+                if (activeOffset.isNaN()) {
+                    sampleNorth = result.yaw
+                } else {
+                    sampleNorth = (result.yaw + activeOffset) % 360.0
+                    if (sampleNorth < 0) sampleNorth += 360.0
+                }
+            }
+
+            val sampleRoll: Double
+            if (result.rollAbsolute) {
+                sampleRoll = normalizeDegrees(result.roll)
+            } else {
+                sampleRoll = if (activeOffset.isNaN())
+                    normalizeDegrees(result.roll)
+                else
+                    normalizeDegrees(result.roll + activeOffset)
+            }
+
+            if (sampleBuffer.isNotEmpty()) {
+                val yawReference = if (isAbsoluteNorth)
+                    circularWeightedMeanNorth(sampleBuffer)
+                else
+                    circularWeightedMeanRaw(sampleBuffer)
+                val yawCompareValue = if (isAbsoluteNorth) sampleNorth else result.yaw
+                val yawDiff = abs(angleDifference(yawReference, yawCompareValue))
+                val rollReference = circularWeightedMeanRoll(sampleBuffer)
+                val rollDiff = abs(angleDifference(rollReference, sampleRoll))
+                val pitchReference = weightedMeanPitch(sampleBuffer)
+                val pitchDiff = abs(pitchReference - result.pitch)
+                val outlierThreshold = if (isAbsoluteNorth)
+                    DIRECT_METHOD_OUTLIER_THRESHOLD_DEG
+                else
+                    45.0
+
+                if (yawDiff > outlierThreshold || rollDiff > outlierThreshold || pitchDiff > PITCH_OUTLIER_THRESHOLD_DEG) {
+                    if (sampleConfidence >= DIRECT_SAMPLE_RESET_CONFIDENCE
+                        && sampleBuffer[0].weight < 0.5
+                    ) {
+                        sampleBuffer.clear()
+                    } else {
+                        return
+                    }
+                }
+            }
+
+            val now = System.currentTimeMillis()
+            if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
+                sampleBuffer.clear()
+            }
+            lastSampleTime = now
+
+            sampleBuffer.add(
+                YawSample(
+                    result.yaw,
+                    sampleNorth,
+                    result.pitch,
+                    sampleRoll,
+                    sampleConfidence
+                )
+            )
+            if (sampleBuffer.size >= REQUIRED_SAMPLES) {
+                isSampling = false
+
+                val finalYaw: Double = if (isAbsoluteNorth) {
+                    circularWeightedMeanNorth(sampleBuffer)
+                } else {
+                    circularWeightedMeanRaw(sampleBuffer)
+                }
+                val finalPitch = weightedMeanPitch(sampleBuffer)
+                val finalRoll = circularWeightedMeanRoll(sampleBuffer)
+                sampleBuffer.clear()
+                commitReading(session, finalYaw, finalPitch, finalRoll)
+            }
         }
     }
 
-    private fun circularMeanDegrees(samples: MutableList<Double?>): Double {
+    private fun circularMeanDegrees(samples: List<Double>): Double {
         if (samples.isEmpty()) return 0.0
         var sumSin = 0.0
         var sumCos = 0.0
         for (value in samples) {
-            val rad = Math.toRadians(value!!)
+            val rad = Math.toRadians(value)
             sumSin += sin(rad)
             sumCos += cos(rad)
         }
@@ -866,29 +774,28 @@ class MainActivity : AppCompatActivity() {
         return mean
     }
 
-    private fun filterCircularOutliers(samples: MutableList<Double?>): MutableList<Double?> {
-        if (samples.size < 5) return ArrayList<Double?>(samples)
-
+    private fun filterCircularOutliers(samples: List<Double>): List<Double> {
+        if (samples.size < 5) return ArrayList(samples)
         val center = circularMeanDegrees(samples)
-        val deviations: MutableList<Double> = ArrayList<Double>(samples.size)
+        val deviations: MutableList<Double> = ArrayList(samples.size)
         for (sample in samples) {
-            deviations.add(abs(angleDifference(center, sample!!)))
+            deviations.add(abs(angleDifference(center, sample)))
         }
-        Collections.sort(deviations)
+        deviations.sort()
 
-        val medianDeviation: Double = deviations.get(deviations.size / 2)
+        val medianDeviation: Double = deviations[deviations.size / 2]
         val threshold = max(3.0, min(20.0, medianDeviation * 3.0 + 2.0))
 
-        val filtered: MutableList<Double?> = ArrayList<Double?>(samples.size)
+        val filtered: MutableList<Double> = ArrayList(samples.size)
         for (sample in samples) {
-            if (abs(angleDifference(center, sample!!)) <= threshold) {
+            if (abs(angleDifference(center, sample)) <= threshold) {
                 filtered.add(sample)
             }
         }
 
         val minimumKept = max(8, samples.size / 2)
         if (filtered.size < minimumKept) {
-            return ArrayList<Double?>(samples)
+            return ArrayList(samples)
         }
         return filtered
     }
@@ -903,7 +810,8 @@ class MainActivity : AppCompatActivity() {
 
         val payload = session.payload
         val isAbsoluteNorth = session.absoluteNorth == true
-        val finalRoll = normalizeDegrees(inputRoll)
+        val finalPitch = -inputPitch
+        val finalRoll = normalizeDegrees(inputRoll + 90.0)
 
         val offsetUsed: Double
         var finalNorthYaw: Double
@@ -919,23 +827,29 @@ class MainActivity : AppCompatActivity() {
                 finalNorthYaw = inputYaw
             }
         }
-
         activeSamplingSession = null
         lastMeasurementMethod = null
         samplingOffsetAnchor = Double.NaN
         committedPayload = payload
 
-        Log.d("test", "commitReading: purpose=${session.purpose} payload=$payload yaw=$finalNorthYaw pitch=$inputPitch roll=$finalRoll")
+        Log.d(
+            TAG, "commitReading: purpose=${session.purpose} payload=$payload" +
+                    " rawYaw=$inputYaw rawPitch=$inputPitch rawRoll=$inputRoll" +
+                    " → finalYaw=$finalNorthYaw finalPitch=$finalPitch finalRoll=$finalRoll" +
+                    " method=${session.lockedMethod} absoluteNorth=$isAbsoluteNorth" +
+                    " sensorOrientation=$backCameraSensorOrientationDegrees"
+        )
         if (session.purpose == SamplingPurpose.REGISTER) {
-            persistOffsetMetadata(payload, isAbsoluteNorth, offsetUsed)
             val resultIntent = android.content.Intent().apply {
                 putExtra("url", payload)
                 putExtra("yaw", finalNorthYaw)
-                putExtra("pitch", inputPitch)
+                putExtra("pitch", finalPitch)
                 putExtra("roll", finalRoll)
             }
             runOnUiThread {
                 setResult(RESULT_OK, resultIntent)
+                timeoutHandler.removeCallbacks(timeoutRunnable)
+                stopFOP()
                 finish()
             }
         } else {
@@ -944,6 +858,9 @@ class MainActivity : AppCompatActivity() {
                 val offsetDelta = abs(angleDifference(storedOffset, offsetUsed))
                 val offsetDrifted = offsetDelta > 10.0
             }
+            timeoutHandler.postDelayed({
+                synchronized(samplingLock) { committedPayload = null }
+            }, 2000)
         }
     }
 
@@ -976,9 +893,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 2. Ensure Normal is facing the camera
         val camFwd = floatArrayOf(-camPose[8], -camPose[9], -camPose[10])
-        val dotNormalCamFwd: kotlin.Float = vec3Dot(planeNormal, camFwd)
+        val dotNormalCamFwd: Float = vec3Dot(planeNormal, camFwd)
         if (dotNormalCamFwd < 0) {
             planeNormal = vec3Scale(planeNormal, -1f)
             if (vpNormalCam != null) {
@@ -1099,8 +1015,7 @@ class MainActivity : AppCompatActivity() {
         val br = floatArrayOf(imagePoints[4], imagePoints[5])
         val bl = floatArrayOf(imagePoints[6], imagePoints[7])
         val vp = computeNormalViaVanishingPoint(tl, tr, br, bl, focal, pp, camPose) ?: return false
-        // normalCam[2] is dot product with camera forward (0,0,1); already forced positive
-        return vp.normalCam[2] >= 0.4f  // reject angles > ~66° off-axis
+        return vp.normalCam[2] >= 0.4f
     }
 
     private fun angleDifference(a: Double, b: Double): Double {
@@ -1159,21 +1074,23 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
+        if (fopAttitude != null) {
+            return null
+        }
+
         val vpUpWorld: FloatArray = rotateCamToWorld(vpUpCam, camPose)
         val roll = computeWallRollDegrees(vpUpWorld, planeNormalWorld)
         if (roll.isNaN()) {
             return null
         }
 
-        // Use the 180° aligned wall-normal math so the VP fallback matches the direct wall path.
         val alignedVpYaw = normalizeDegrees(vpWallRawYaw + 180.0)
         var finalYaw = alignedVpYaw
-
-        // Legacy 2D offset mode still needs the sampled anchor baked in here.
-        if (fopAttitude == null && !samplingOffsetAnchor.isNaN()) {
+        if (!samplingOffsetAnchor.isNaN()) {
             finalYaw = normalizeDegrees(alignedVpYaw + samplingOffsetAnchor)
         }
-        return QRMeasurement(finalYaw, pitch, roll, 0.8, "wall-vp-direct", true)
+
+        return QRMeasurement(finalYaw, pitch, roll, 0.8, "wall-vp", true)
     }
 
     private fun computeWallVpUpVectorInCamera(
@@ -1196,13 +1113,12 @@ class MainActivity : AppCompatActivity() {
         val centerRay: FloatArray = toCameraRay(floatArrayOf(centerX, centerY, 1f), fx, fy, cx, cy)
         val topMidRay: FloatArray = toCameraRay(floatArrayOf(topMidX, topMidY, 1f), fx, fy, cx, cy)
 
-        val centerDenom: kotlin.Float = vec3Dot(centerRay, normalCam)
-        val topDenom: kotlin.Float = vec3Dot(topMidRay, normalCam)
+        val centerDenom: Float = vec3Dot(centerRay, normalCam)
+        val topDenom: Float = vec3Dot(topMidRay, normalCam)
         if (abs(centerDenom) < 1e-6f || abs(topDenom) < 1e-6f) {
             return null
         }
 
-        // Plane scale is arbitrary here; n·X = 1 is enough to recover an in-plane direction.
         val centerPoint: FloatArray = vec3Scale(centerRay, 1f / centerDenom)
         val topPoint: FloatArray = vec3Scale(topMidRay, 1f / topDenom)
         var upCam = floatArrayOf(
@@ -1211,7 +1127,7 @@ class MainActivity : AppCompatActivity() {
             topPoint[2] - centerPoint[2]
         )
 
-        val normalComponent: kotlin.Float = vec3Dot(upCam, normalCam)
+        val normalComponent: Float = vec3Dot(upCam, normalCam)
         upCam = floatArrayOf(
             upCam[0] - normalCam[0] * normalComponent,
             upCam[1] - normalCam[1] * normalComponent,
@@ -1225,7 +1141,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toCornerList(points: FloatArray): MutableList<FloatArray?> {
-        val corners: MutableList<FloatArray?> = ArrayList<FloatArray?>(4)
+        val corners: MutableList<FloatArray?> = ArrayList(4)
         for (i in 0..3) {
             corners.add(floatArrayOf(points[i * 2], points[i * 2 + 1]))
         }
@@ -1267,11 +1183,11 @@ class MainActivity : AppCompatActivity() {
             val refinedPoints = FloatArray(imagePoints.size)
             var totalShift = 0.0
             var maxShift = 0.0
-            for (i in refined.indices) {
-                val xIndex = i * 2
+            for (j in refined.indices) {
+                val xIndex = j * 2
                 val yIndex = xIndex + 1
-                refinedPoints[xIndex] = refined[i]!!.x.toFloat()
-                refinedPoints[yIndex] = refined[i]!!.y.toFloat()
+                refinedPoints[xIndex] = refined[j]!!.x.toFloat()
+                refinedPoints[yIndex] = refined[j]!!.y.toFloat()
 
                 val dx = (refinedPoints[xIndex] - imagePoints[xIndex]).toDouble()
                 val dy = (refinedPoints[yIndex] - imagePoints[yIndex]).toDouble()
@@ -1292,40 +1208,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Continuous QR Detection via ML Kit + ZXing
-    // ─────────────────────────────────────────────────────────────────────────
     private fun processARFrame(frame: Frame) {
         if (!isProcessingFrame.compareAndSet(false, true)) return
         scanQrFromArFrame(frame)
     }
 
-    @OptIn(ExperimentalGetImage::class)
     private fun scanQrFromArFrame(frame: Frame) {
+        var cameraImage: android.media.Image? = null
         try {
-            val cameraImage = frame.acquireCameraImage()
-            val capturedImageTimestampNs = cameraImage.getTimestamp()
+            cameraImage = frame.acquireCameraImage()
+            val capturedImageTimestampNs = cameraImage.timestamp
             val capturedAcquireElapsedRealtimeNs = SystemClock.elapsedRealtimeNanos()
 
             val capturedIntrinsics = frame.getCamera().getImageIntrinsics()
             val capturedPose = FloatArray(16)
             frame.getCamera().getPose().toMatrix(capturedPose, 0)
-            val capturedFrame = frame
-
-            // 1. Extract Grayscale (Y) plane SAFELY (Strips hardware padding)
-            val yPlane = cameraImage.getPlanes()[0]
-            val yBuffer = yPlane.getBuffer()
-            val yRowStride = yPlane.getRowStride()
-            val width = cameraImage.getWidth()
-            val height = cameraImage.getHeight()
+            val yPlane = cameraImage.planes[0]
+            val yBuffer = yPlane.buffer
+            val yRowStride = yPlane.rowStride
+            val width = cameraImage.width
+            val height = cameraImage.height
 
             val yData = ByteArray(width * height)
 
             if (yRowStride == width) {
-                // Tightly packed memory (No padding)
                 yBuffer.get(yData)
             } else {
-                // Padded memory - strip it row by row so OpenCV doesn't crash
                 val rowBuffer = ByteArray(yRowStride)
                 for (row in 0..<height) {
                     yBuffer.position(row * yRowStride)
@@ -1334,119 +1242,105 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            cameraImage.close() // Close immediately to free ARCore
+            cameraImage.close()
+            cameraImage = null
 
-            // 2. Offload to background thread
-            qrExecutor.execute {
-                try {
-                    // Initialize Mat with the perfectly sized byte array
-                    val grayMat = Mat(height, width, CvType.CV_8UC1)
-                    grayMat.put(0, 0, yData)
+            try {
+                qrExecutor.execute {
+                    var grayMat: Mat? = null
+                    var points: MutableList<Mat>? = null
+                    try {
+                        grayMat = Mat(height, width, CvType.CV_8UC1)
+                        grayMat.put(0, 0, yData)
 
-                    val points: MutableList<Mat> = ArrayList<Mat>()
-                    val results = WeChatQRCodeDetector.detectAndDecode(grayMat, points)
+                        points = ArrayList()
+                        val results = WeChatQRCodeDetector.detectAndDecode(grayMat, points)
 
-                    // --- QR LOST LOGIC ---
-                    if (results == null || results.isEmpty() || points.isEmpty()) {
-                        val now = System.currentTimeMillis()
-                        val qrTrulyLost = (now - lastQrSeenTime) > QR_LOST_TIMEOUT_MS
-                        if (qrTrulyLost) {
-                            runOnUiThread {
-//                                overlayView!!.setCorners(null)
-                                lastDetectedCorners = null
-                                if (isSampling) {
-                                    abortActiveSampling("⚠️ QR lost during sampling. Try again.")
+                        if (results == null || results.isEmpty() || points.isEmpty()) {
+                            val now = System.currentTimeMillis()
+                            val qrTrulyLost = (now - lastQrSeenTime) > QR_LOST_TIMEOUT_MS
+                            if (qrTrulyLost) {
+                                runOnUiThread {
+                                    lastDetectedCorners = null
+                                    if (isSampling) {
+                                        abortActiveSampling("QR lost during sampling. Try again.")
+                                    }
                                 }
                             }
+                            return@execute
                         }
 
-                        // Release C++ memory
-                        grayMat.release()
-                        return@execute  // Jumps to 'finally' block
-                    }
-
-                    // --- QR FOUND LOGIC ---
-                    lastQrSeenTime = System.currentTimeMillis()
-                    val payload = results.get(0)
-                    Log.d("test", "processARFrame: QR detected payload=$payload")
-
-                    // Extract Intrinsic Corners
-                    val cornersMat = points.get(0)
-                    val cornerData = FloatArray(8)
-                    cornersMat.get(0, 0, cornerData)
-
-                    // [0,1]=TL | [2,3]=TR | [4,5]=BR | [6,7]=BL
-                    val detectorImagePoints = floatArrayOf(
-                        cornerData[0], cornerData[1],
-                        cornerData[2], cornerData[3],
-                        cornerData[4], cornerData[5],
-                        cornerData[6], cornerData[7]
-                    )
-                    val imagePoints = refineCornersSubPixel(grayMat, detectorImagePoints)
-
-                    // Project to AR View for overlay
-                    val viewPoints = FloatArray(8)
-                    try {
-                        capturedFrame.transformCoordinates2d(
-                            Coordinates2d.IMAGE_PIXELS, imagePoints,
-                            Coordinates2d.VIEW, viewPoints
+                        lastQrSeenTime = System.currentTimeMillis()
+                        val payload = results[0]
+                        val cornersMat = points[0]
+                        val cornerData = FloatArray(8)
+                        cornersMat.get(0, 0, cornerData)
+                        val detectorImagePoints = floatArrayOf(
+                            cornerData[0], cornerData[1],
+                            cornerData[2], cornerData[3],
+                            cornerData[4], cornerData[5],
+                            cornerData[6], cornerData[7]
                         )
+                        val imagePoints = refineCornersSubPixel(grayMat, detectorImagePoints)
+                        val viewPoints = FloatArray(8)
+                        try {
+                            val capturedFrame = frame
+                            capturedFrame.transformCoordinates2d(
+                                Coordinates2d.IMAGE_PIXELS, imagePoints,
+                                Coordinates2d.VIEW, viewPoints
+                            )
+                        } catch (e: Exception) {
+                            return@execute
+                        }
+
+                        val cornersList = toCornerList(viewPoints)
+
+                        runOnUiThread {
+                            val scanRect = binding.blueBorder.getScanRect()
+
+                            val insideScanArea = isValidateMode || ((0 until 4).all { i ->
+                                scanRect.contains(viewPoints[i * 2], viewPoints[i * 2 + 1])
+                            })
+
+                            val angleOk = insideScanArea &&
+                                    isViewingAngleAcceptable(
+                                        imagePoints,
+                                        capturedPose,
+                                        capturedIntrinsics
+                                    )
+
+                            lastDetectedCorners = cornersList
+                            if (!angleOk) return@runOnUiThread
+
+                            onQRPayloadDetected(payload)
+                            if (isSampling && !isCollectingMag && !samplingOffsetAnchor.isNaN()) {
+                                val resolvedFopAttitude = resolveFopAttitudeForFrame(
+                                    capturedImageTimestampNs,
+                                    capturedAcquireElapsedRealtimeNs
+                                )
+                                collectSampleWithPose(
+                                    imagePoints,
+                                    capturedPose,
+                                    capturedIntrinsics,
+                                    resolvedFopAttitude,
+                                    payload
+                                )
+                            }
+                        }
                     } catch (e: Exception) {
-                        grayMat.release()
-                        cornersMat.release()
-                        return@execute  // Jumps to 'finally' block
+                    } finally {
+                        grayMat?.release()
+                        points?.let { for (m in it) m.release() }
+                        isProcessingFrame.set(false)
                     }
-
-                    val cornersList = toCornerList(viewPoints)
-
-                    runOnUiThread {
-                        val scanRect = blueBorder?.getScanRect()
-                        Log.d("test", "processARFrame: scanRect=$scanRect  blueBorder=$blueBorder")
-
-                        val insideScanArea = scanRect != null && (0 until 4).all { i ->
-                            scanRect.contains(viewPoints[i * 2], viewPoints[i * 2 + 1])
-                        }
-                        Log.d("test", "processARFrame: insideScanArea=$insideScanArea  viewPoints=${viewPoints.toList()}")
-
-                        val angleOk = insideScanArea &&
-                                isViewingAngleAcceptable(imagePoints, capturedPose, capturedIntrinsics)
-                        Log.d("test", "processARFrame: angleOk=$angleOk  insideScanArea=$insideScanArea")
-
-                        lastDetectedCorners = cornersList
-//                        overlayView!!.setCorners(if (angleOk) cornersList else null)
-                        if (!angleOk) return@runOnUiThread
-
-                        Log.d("test", "processARFrame: calling onQRPayloadDetected isSampling=$isSampling")
-                        onQRPayloadDetected(payload)
-
-                        Log.d("test", "processARFrame: after onQRPayloadDetected isSampling=$isSampling isCollectingMag=$isCollectingMag samplingOffsetAnchor=$samplingOffsetAnchor")
-                        if (isSampling && !isCollectingMag && !samplingOffsetAnchor.isNaN()) {
-                            Log.d("test", "processARFrame: calling collectSampleWithPose")
-                            val resolvedFopAttitude = resolveFopAttitudeForFrame(
-                                capturedImageTimestampNs,
-                                capturedAcquireElapsedRealtimeNs
-                            )
-                            collectSampleWithPose(
-                                imagePoints,
-                                capturedPose,
-                                capturedIntrinsics,
-                                resolvedFopAttitude,
-                                payload
-                            )
-                        }
-                    }
-
-                    grayMat.release()
-                    for (m in points) m.release()
-                } catch (e: Exception) {
-                    Log.e("test", "processARFrame: exception in QR executor", e)
-                } finally {
-                    isProcessingFrame.set(false)
                 }
+            } catch (e: RejectedExecutionException) {
+                isProcessingFrame.set(false)
             }
         } catch (e: Exception) {
-            Log.e("test", "processARFrame: exception starting QR executor", e)
             isProcessingFrame.set(false)
+        } finally {
+            cameraImage?.close()
         }
     }
 
@@ -1482,10 +1376,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun normalizeDegrees(angle: Double): Double {
-        var angle = angle
-        angle %= 360.0
-        if (angle < 0) angle += 360.0
-        return angle
+        var a = angle
+        a %= 360.0
+        if (a < 0) a += 360.0
+        return a
     }
 
     private fun computeWallRollDegrees(upWorld: FloatArray, normalWorld: FloatArray): Double {
@@ -1515,45 +1409,38 @@ class MainActivity : AppCompatActivity() {
         camPose: FloatArray,
         fopAttitude: FloatArray?
     ): QRMeasurement? {
+        val focal = intrinsics.getFocalLength()
+        val pp = intrinsics.getPrincipalPoint()
+
+        val fx = focal[0].toDouble()
+        val fy = focal[1].toDouble()
+        val cx = pp[0].toDouble()
+        val cy = pp[1].toDouble()
+
+        val cameraMatrix = Mat(3, 3, CvType.CV_64F)
+        val distCoeffs = MatOfDouble(0.0, 0.0, 0.0, 0.0, 0.0)
+        val objectPoints = MatOfPoint3f(
+            Point3(-HALF_QR_SIZE, HALF_QR_SIZE, 0.0),
+            Point3(HALF_QR_SIZE, HALF_QR_SIZE, 0.0),
+            Point3(HALF_QR_SIZE, -HALF_QR_SIZE, 0.0),
+            Point3(-HALF_QR_SIZE, -HALF_QR_SIZE, 0.0)
+        )
+        val imagePts = MatOfPoint2f(
+            Point(imagePoints[0].toDouble(), imagePoints[1].toDouble()),
+            Point(imagePoints[2].toDouble(), imagePoints[3].toDouble()),
+            Point(imagePoints[4].toDouble(), imagePoints[5].toDouble()),
+            Point(imagePoints[6].toDouble(), imagePoints[7].toDouble())
+        )
+        val rvecs: MutableList<Mat> = ArrayList()
+        val tvecs: MutableList<Mat> = ArrayList()
+
         try {
-            val focal = intrinsics.getFocalLength()
-            val pp = intrinsics.getPrincipalPoint()
-
-            val fx = focal[0].toDouble()
-            val fy = focal[1].toDouble()
-            val cx = pp[0].toDouble()
-            val cy = pp[1].toDouble()
-
-            val cameraMatrix = Mat(3, 3, CvType.CV_64F)
             cameraMatrix.put(
                 0, 0,
                 fx, 0.0, cx,
                 0.0, fy, cy,
                 0.0, 0.0, 1.0
             )
-
-            val distCoeffs = MatOfDouble(0.0, 0.0, 0.0, 0.0, 0.0)
-
-            val half = 0.1.toFloat() / 2.0
-
-            // IPPE_SQUARE expects points in this exact square coordinate order:
-            // top-left, top-right, bottom-right, bottom-left in object space.
-            val objectPoints = MatOfPoint3f(
-                Point3(-half, half, 0.0),
-                Point3(half, half, 0.0),
-                Point3(half, -half, 0.0),
-                Point3(-half, -half, 0.0)
-            )
-
-            val imagePts = MatOfPoint2f(
-                Point(imagePoints[0].toDouble(), imagePoints[1].toDouble()),
-                Point(imagePoints[2].toDouble(), imagePoints[3].toDouble()),
-                Point(imagePoints[4].toDouble(), imagePoints[5].toDouble()),
-                Point(imagePoints[6].toDouble(), imagePoints[7].toDouble())
-            )
-
-            val rvecs: MutableList<Mat> = ArrayList<Mat>()
-            val tvecs: MutableList<Mat> = ArrayList<Mat>()
 
             val numSolutions = Calib3d.solvePnPGeneric(
                 objectPoints, imagePts, cameraMatrix, distCoeffs,
@@ -1576,93 +1463,112 @@ class MainActivity : AppCompatActivity() {
 
             for (solIdx in 0..<numSolutions) {
                 val rotationMatrix = Mat()
-                Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix)
+                try {
+                    Calib3d.Rodrigues(rvecs[solIdx], rotationMatrix)
 
-                val normalCamX = rotationMatrix.get(0, 2)[0]
-                val normalCamY = rotationMatrix.get(1, 2)[0]
-                val normalCamZ = rotationMatrix.get(2, 2)[0]
+                    val normalCamX = rotationMatrix.get(0, 2)[0]
+                    val normalCamY = rotationMatrix.get(1, 2)[0]
+                    val normalCamZ = rotationMatrix.get(2, 2)[0]
 
-                val upCamX = rotationMatrix.get(0, 1)[0]
-                val upCamY = rotationMatrix.get(1, 1)[0]
-                val upCamZ = rotationMatrix.get(2, 1)[0]
+                    val upCamX = rotationMatrix.get(0, 1)[0]
+                    val upCamY = rotationMatrix.get(1, 1)[0]
+                    val upCamZ = rotationMatrix.get(2, 1)[0]
 
-                val upCamAndroid = floatArrayOf(
-                    upCamX.toFloat(),
-                    -upCamY.toFloat(),
-                    -upCamZ.toFloat()
-                )
-                val normalCamAndroid = floatArrayOf(
-                    normalCamX.toFloat(),
-                    -normalCamY.toFloat(),
-                    -normalCamZ.toFloat()
-                )
-
-                val uWorld: FloatArray = rotateCamToWorld(upCamAndroid, camPose)
-                val nWorld: FloatArray = rotateCamToWorld(normalCamAndroid, camPose)
-
-                if (nWorld[1] < 0) {
-                    uWorld[0] = -uWorld[0]
-                    uWorld[1] = -uWorld[1]
-                    uWorld[2] = -uWorld[2]
-                }
-
-                val solPitch = Math.toDegrees(
-                    asin(
-                        max(-1.0, min(1.0, nWorld[1].toDouble()))
+                    val upCamAndroid = floatArrayOf(
+                        upCamX.toFloat(),
+                        -upCamY.toFloat(),
+                        -upCamZ.toFloat()
                     )
-                )
+                    val normalCamAndroid = floatArrayOf(
+                        normalCamX.toFloat(),
+                        -normalCamY.toFloat(),
+                        -normalCamZ.toFloat()
+                    )
 
-                val score = abs(uWorld[1]).toDouble()
-                val reprojError = computeReprojectionRmse(
-                    objectPoints,
-                    imagePts,
-                    cameraMatrix,
-                    distCoeffs,
-                    rvecs.get(solIdx),
-                    tvecs.get(solIdx)
-                )
+                    val uWorld: FloatArray = rotateCamToWorld(upCamAndroid, camPose)
+                    val nWorld: FloatArray = rotateCamToWorld(normalCamAndroid, camPose)
 
-                var solYaw: Double
-
-                if (useDirect) {
-                    val upCamDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ)
-
-                    val rotMatrix = FloatArray(9)
-                    SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude)
-
-                    var upCamFinal = upCamDevice
                     if (nWorld[1] < 0) {
-                        upCamFinal = floatArrayOf(-upCamDevice[0], -upCamDevice[1], -upCamDevice[2])
+                        uWorld[0] = -uWorld[0]
+                        uWorld[1] = -uWorld[1]
+                        uWorld[2] = -uWorld[2]
                     }
-                    val upEast =
-                        rotMatrix[0] * upCamFinal[0] + rotMatrix[1] * upCamFinal[1] + rotMatrix[2] * upCamFinal[2]
-                    val upNorth =
-                        rotMatrix[3] * upCamFinal[0] + rotMatrix[4] * upCamFinal[1] + rotMatrix[5] * upCamFinal[2]
-                    solYaw = Math.toDegrees(atan2(upEast.toDouble(), upNorth.toDouble()))
-                    if (solYaw < 0) solYaw += 360.0
-                } else {
-                    solYaw = normalizeDegrees(
-                        Math.toDegrees(
-                            atan2(
-                                uWorld[0].toDouble(),
-                                uWorld[2].toDouble()
-                            )
+
+                    val solPitch = Math.toDegrees(
+                        asin(
+                            max(-1.0, min(1.0, nWorld[1].toDouble()))
                         )
                     )
-                }
-                val solRoll = solYaw
 
-                if (score < bestScore) {
-                    bestScore = score
-                    bestYaw = solYaw
-                    bestPitch = solPitch
-                    bestRoll = solRoll
-                    bestReprojectionError = reprojError
+                    // score = how vertical the QR's "up" vector is.
+                    // For a real floor QR, the up vector lies in the horizontal plane → score ≈ 0.
+                    // For a wall QR forced into floor interpretation, up vector is vertical → score ≈ 1.
+                    val score = abs(uWorld[1]).toDouble()
+
+                    // Reject solutions where the QR up vector is too vertical.
+                    // This catches wall QRs misclassified as floor by the VP.
+                    if (score > FLOOR_UP_VECTOR_VERTICAL_LIMIT) {
+                        continue
+                    }
+
+                    val reprojError = computeReprojectionRmse(
+                        objectPoints,
+                        imagePts,
+                        cameraMatrix,
+                        distCoeffs,
+                        rvecs[solIdx],
+                        tvecs[solIdx]
+                    )
+
+                    // Gate on reprojection error — degenerate solutions have high error
+                    if (reprojError > FLOOR_REPROJECTION_GATE_PX) {
+                        continue
+                    }
+
+                    var solYaw: Double
+
+                    if (useDirect) {
+                        val upCamDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ)
+
+                        val rotMatrix = FloatArray(9)
+                        SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude)
+
+                        var upCamFinal = upCamDevice
+                        if (nWorld[1] < 0) {
+                            upCamFinal =
+                                floatArrayOf(-upCamDevice[0], -upCamDevice[1], -upCamDevice[2])
+                        }
+                        val upEast =
+                            rotMatrix[0] * upCamFinal[0] + rotMatrix[1] * upCamFinal[1] + rotMatrix[2] * upCamFinal[2]
+                        val upNorth =
+                            rotMatrix[3] * upCamFinal[0] + rotMatrix[4] * upCamFinal[1] + rotMatrix[5] * upCamFinal[2]
+                        solYaw = Math.toDegrees(atan2(upEast.toDouble(), upNorth.toDouble()))
+                        if (solYaw < 0) solYaw += 360.0
+                        // Floor yaw: flip 180° to match iOS convention
+                        solYaw = normalizeDegrees(solYaw + 180.0)
+                    } else {
+                        solYaw = normalizeDegrees(
+                            Math.toDegrees(
+                                atan2(
+                                    uWorld[0].toDouble(),
+                                    uWorld[2].toDouble()
+                                )
+                            ) + 180.0  // flip 180° to match iOS convention
+                        )
+                    }
+                    val solRoll = solYaw
+
+                    if (score < bestScore) {
+                        bestScore = score
+                        bestYaw = solYaw
+                        bestPitch = solPitch
+                        bestRoll = solRoll
+                        bestReprojectionError = reprojError
+                    }
+                } finally {
+                    rotationMatrix.release()
                 }
-                rotationMatrix.release()
             }
-            for (r in rvecs) r.release()
-            for (t in tvecs) t.release()
 
             val method = if (useDirect) "floor-solvepnp-direct" else "floor-solvepnp"
             val confidence = if (useDirect)
@@ -1671,11 +1577,19 @@ class MainActivity : AppCompatActivity() {
                 1.0
             return QRMeasurement(bestYaw, bestPitch, bestRoll, confidence, method, useDirect)
         } catch (e: Exception) {
+            Log.e(TAG, "computeFloorYawWithSolvePnP failed", e)
             return null
+        } finally {
+            // BUG #3 FIX: Always release all native Mats
+            cameraMatrix.release()
+            distCoeffs.release()
+            objectPoints.release()
+            imagePts.release()
+            for (r in rvecs) r.release()
+            for (t in tvecs) t.release()
         }
     }
 
-    // Reprojection RMSE for a candidate PnP pose.
     private fun computeReprojectionRmse(
         objectPoints: MatOfPoint3f,
         imagePoints: MatOfPoint2f,
@@ -1720,41 +1634,38 @@ class MainActivity : AppCompatActivity() {
         vpWallRawYaw: Double,
         vpWallNorthYaw: Double
     ): QRMeasurement? {
+        val focal = intrinsics.getFocalLength()
+        val pp = intrinsics.getPrincipalPoint()
+
+        val fx = focal[0].toDouble()
+        val fy = focal[1].toDouble()
+        val cx = pp[0].toDouble()
+        val cy = pp[1].toDouble()
+
+        val cameraMatrix = Mat(3, 3, CvType.CV_64F)
+        val distCoeffs = MatOfDouble(0.0, 0.0, 0.0, 0.0, 0.0)
+        val objectPoints = MatOfPoint3f(
+            Point3(-HALF_QR_SIZE, HALF_QR_SIZE, 0.0),
+            Point3(HALF_QR_SIZE, HALF_QR_SIZE, 0.0),
+            Point3(HALF_QR_SIZE, -HALF_QR_SIZE, 0.0),
+            Point3(-HALF_QR_SIZE, -HALF_QR_SIZE, 0.0)
+        )
+        val imagePts = MatOfPoint2f(
+            Point(imagePoints[0].toDouble(), imagePoints[1].toDouble()),
+            Point(imagePoints[2].toDouble(), imagePoints[3].toDouble()),
+            Point(imagePoints[4].toDouble(), imagePoints[5].toDouble()),
+            Point(imagePoints[6].toDouble(), imagePoints[7].toDouble())
+        )
+        val rvecs: MutableList<Mat> = ArrayList()
+        val tvecs: MutableList<Mat> = ArrayList()
+
         try {
-            val focal = intrinsics.getFocalLength()
-            val pp = intrinsics.getPrincipalPoint()
-
-            val fx = focal[0].toDouble()
-            val fy = focal[1].toDouble()
-            val cx = pp[0].toDouble()
-            val cy = pp[1].toDouble()
-
-            val cameraMatrix = Mat(3, 3, CvType.CV_64F)
             cameraMatrix.put(
                 0, 0,
                 fx, 0.0, cx,
                 0.0, fy, cy,
                 0.0, 0.0, 1.0
             )
-
-            val distCoeffs = MatOfDouble(0.0, 0.0, 0.0, 0.0, 0.0)
-            val half = 0.1.toFloat() / 2.0
-            val objectPoints = MatOfPoint3f(
-                Point3(-half, half, 0.0),
-                Point3(half, half, 0.0),
-                Point3(half, -half, 0.0),
-                Point3(-half, -half, 0.0)
-            )
-
-            val imagePts = MatOfPoint2f(
-                Point(imagePoints[0].toDouble(), imagePoints[1].toDouble()),
-                Point(imagePoints[2].toDouble(), imagePoints[3].toDouble()),
-                Point(imagePoints[4].toDouble(), imagePoints[5].toDouble()),
-                Point(imagePoints[6].toDouble(), imagePoints[7].toDouble())
-            )
-
-            val rvecs: MutableList<Mat> = ArrayList<Mat>()
-            val tvecs: MutableList<Mat> = ArrayList<Mat>()
 
             val numSolutions = Calib3d.solvePnPGeneric(
                 objectPoints, imagePts, cameraMatrix, distCoeffs,
@@ -1763,10 +1674,6 @@ class MainActivity : AppCompatActivity() {
             )
 
             if (numSolutions == 0) {
-                cameraMatrix.release()
-                distCoeffs.release()
-                objectPoints.release()
-                imagePts.release()
                 return null
             }
 
@@ -1783,9 +1690,6 @@ class MainActivity : AppCompatActivity() {
             var bestRoll = 0.0
             var bestReprojectionError = Double.NaN
             var bestSolutionIdx = -1
-            var bestNormalCamX = 0.0
-            var bestNormalCamY = 0.0
-            var bestNormalCamZ = 0.0
             var secondBestScore = Double.MAX_VALUE
             var secondBestYaw = 0.0
             var secondBestSolutionIdx = -1
@@ -1793,51 +1697,115 @@ class MainActivity : AppCompatActivity() {
             for (solIdx in 0..<numSolutions) {
                 val rotationMatrix = Mat()
                 try {
-                    Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix)
+                    Calib3d.Rodrigues(rvecs[solIdx], rotationMatrix)
 
-                    val normalCamX = rotationMatrix.get(0, 2)[0]
-                    val normalCamY = rotationMatrix.get(1, 2)[0]
-                    val normalCamZ = rotationMatrix.get(2, 2)[0]
-                    val upCamX = rotationMatrix.get(0, 1)[0]
-                    val upCamY = rotationMatrix.get(1, 1)[0]
-                    val upCamZ = rotationMatrix.get(2, 1)[0]
+                    var normalCamX = rotationMatrix.get(0, 2)[0]
+                    var normalCamY = rotationMatrix.get(1, 2)[0]
+                    var normalCamZ = rotationMatrix.get(2, 2)[0]
+                    var upCamX = rotationMatrix.get(0, 1)[0]
+                    var upCamY = rotationMatrix.get(1, 1)[0]
+                    var upCamZ = rotationMatrix.get(2, 1)[0]
 
-                    val normalCamAndroid = floatArrayOf(
-                        normalCamX.toFloat(),
-                        -normalCamY.toFloat(),
-                        -normalCamZ.toFloat()
-                    )
-                    val upCamAndroid = floatArrayOf(
-                        upCamX.toFloat(),
-                        -upCamY.toFloat(),
-                        -upCamZ.toFloat()
-                    )
-                    val normalWorld: FloatArray = rotateCamToWorld(normalCamAndroid, camPose)
-                    val upWorld: FloatArray = rotateCamToWorld(upCamAndroid, camPose)
+                    val frontFacing = normalCamZ < 0.0
+                    if (!frontFacing) {
+                        normalCamX = -normalCamX
+                        normalCamY = -normalCamY
+                        normalCamZ = -normalCamZ
+                        upCamX = -upCamX
+                        upCamY = -upCamY
+                        upCamZ = -upCamZ
+                    }
 
                     var solYaw: Double
+                    var solPitch: Double
+                    var solRoll: Double
+
                     if (useDirect) {
+                        // Map normal and up to device frame
                         val normalDevice =
                             mapOpenCvCameraVectorToDeviceFrame(normalCamX, normalCamY, normalCamZ)
+                        val upDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ)
+
+                        // Rotate normal to Earth frame via FOP
                         val normalEast =
                             rotMatrix[0] * normalDevice[0] + rotMatrix[1] * normalDevice[1] + rotMatrix[2] * normalDevice[2]
                         val normalNorth =
                             rotMatrix[3] * normalDevice[0] + rotMatrix[4] * normalDevice[1] + rotMatrix[5] * normalDevice[2]
+                        val normalUp =
+                            rotMatrix[6] * normalDevice[0] + rotMatrix[7] * normalDevice[1] + rotMatrix[8] * normalDevice[2]
 
                         val horizLenEarth = hypot(normalEast.toDouble(), normalNorth.toDouble())
                         if (horizLenEarth < 1e-5) {
                             continue
                         }
 
+                        // Yaw and pitch from FOP-rotated normal
                         solYaw =
                             Math.toDegrees(atan2(normalEast.toDouble(), normalNorth.toDouble()))
                         if (solYaw < 0) solYaw += 360.0
+
+                        solPitch = Math.toDegrees(atan2(normalUp.toDouble(), horizLenEarth))
+
+                        val normalEarthVec = floatArrayOf(normalEast, normalNorth, normalUp)
+                        val gravityUp = floatArrayOf(0f, 0f, 1f)
+
+                        val dotGravNormal = vec3Dot(gravityUp, normalEarthVec)
+                        var wallRefUp = floatArrayOf(
+                            gravityUp[0] - dotGravNormal * normalEarthVec[0],
+                            gravityUp[1] - dotGravNormal * normalEarthVec[1],
+                            gravityUp[2] - dotGravNormal * normalEarthVec[2]
+                        )
+
+                        if (vec3Len(wallRefUp) < 1e-4f) {
+                            continue
+                        }
+                        wallRefUp = vec3Normalize(wallRefUp)
+
+                        val upEast =
+                            rotMatrix[0] * upDevice[0] + rotMatrix[1] * upDevice[1] + rotMatrix[2] * upDevice[2]
+                        val upNorth =
+                            rotMatrix[3] * upDevice[0] + rotMatrix[4] * upDevice[1] + rotMatrix[5] * upDevice[2]
+                        val upUp =
+                            rotMatrix[6] * upDevice[0] + rotMatrix[7] * upDevice[1] + rotMatrix[8] * upDevice[2]
+                        val qrUpEarth = floatArrayOf(upEast, upNorth, upUp)
+
+                        val dotQrNormal = vec3Dot(qrUpEarth, normalEarthVec)
+                        var qrUpOnWall = floatArrayOf(
+                            qrUpEarth[0] - dotQrNormal * normalEarthVec[0],
+                            qrUpEarth[1] - dotQrNormal * normalEarthVec[1],
+                            qrUpEarth[2] - dotQrNormal * normalEarthVec[2]
+                        )
+
+                        if (vec3Len(qrUpOnWall) < 1e-4f) {
+                            continue
+                        }
+                        qrUpOnWall = vec3Normalize(qrUpOnWall)
+
+                        val wallRefRight = vec3Normalize(vec3Cross(normalEarthVec, wallRefUp))
+                        if (vec3Len(wallRefRight) < 1e-4f) {
+                            continue
+                        }
+
+                        val cosRoll = vec3Dot(qrUpOnWall, wallRefUp).toDouble()
+                        val sinRoll = vec3Dot(qrUpOnWall, wallRefRight).toDouble()
+                        solRoll = normalizeDegrees(Math.toDegrees(atan2(sinRoll, cosRoll)))
+
                     } else {
+                        val normalCamAndroid = floatArrayOf(
+                            normalCamX.toFloat(), -normalCamY.toFloat(), -normalCamZ.toFloat()
+                        )
+                        val upCamAndroid = floatArrayOf(
+                            upCamX.toFloat(), -upCamY.toFloat(), -upCamZ.toFloat()
+                        )
+                        val normalWorld: FloatArray = rotateCamToWorld(normalCamAndroid, camPose)
+                        val upWorld: FloatArray = rotateCamToWorld(upCamAndroid, camPose)
+
                         val horizLenWorld =
                             hypot(normalWorld[0].toDouble(), normalWorld[2].toDouble())
                         if (horizLenWorld < 1e-5) {
                             continue
                         }
+
                         solYaw = normalizeDegrees(
                             Math.toDegrees(
                                 atan2(
@@ -1846,37 +1814,32 @@ class MainActivity : AppCompatActivity() {
                                 )
                             )
                         )
-                    }
-
-                    val solPitch = Math.toDegrees(
-                        asin(
-                            max(-1.0, min(1.0, normalWorld[1].toDouble()))
-                        )
-                    )
-                    val solRoll = computeWallRollDegrees(upWorld, normalWorld)
-                    if (solRoll.isNaN()) {
-                        continue
+                        solPitch =
+                            Math.toDegrees(asin(max(-1.0, min(1.0, normalWorld[1].toDouble()))))
+                        solRoll = computeWallRollDegrees(upWorld, normalWorld)
+                        if (solRoll.isNaN()) {
+                            continue
+                        }
                     }
 
                     val reprojError = computeReprojectionRmse(
-                        objectPoints,
-                        imagePts,
-                        cameraMatrix,
-                        distCoeffs,
-                        rvecs.get(solIdx),
-                        tvecs.get(solIdx)
+                        objectPoints, imagePts, cameraMatrix, distCoeffs,
+                        rvecs[solIdx], tvecs[solIdx]
                     )
                     if (reprojError > WALL_DIRECT_REPROJECTION_GATE_PX) {
                         continue
                     }
 
-                    val frontFacing = normalCamZ < 0.0
                     val facingPenalty = if (frontFacing) 0.0 else WALL_BACKFACING_PENALTY
                     val continuityPenalty = if (continuityReferenceYaw.isNaN())
                         0.0
                     else
-                        (WALL_CONTINUITY_PENALTY_PER_DEG
-                                * abs(angleDifference(continuityReferenceYaw, solYaw)))
+                        (WALL_CONTINUITY_PENALTY_PER_DEG * abs(
+                            angleDifference(
+                                continuityReferenceYaw,
+                                solYaw
+                            )
+                        ))
                     val score = reprojError + facingPenalty + continuityPenalty
 
                     if (score < bestScore) {
@@ -1890,9 +1853,6 @@ class MainActivity : AppCompatActivity() {
                         bestRoll = solRoll
                         bestReprojectionError = reprojError
                         bestSolutionIdx = solIdx
-                        bestNormalCamX = normalCamX
-                        bestNormalCamY = normalCamY
-                        bestNormalCamZ = normalCamZ
                     } else if (score < secondBestScore) {
                         secondBestScore = score
                         secondBestYaw = solYaw
@@ -1902,13 +1862,6 @@ class MainActivity : AppCompatActivity() {
                     rotationMatrix.release()
                 }
             }
-
-            cameraMatrix.release()
-            distCoeffs.release()
-            objectPoints.release()
-            imagePts.release()
-            for (r in rvecs) r.release()
-            for (t in tvecs) t.release()
 
             if (bestSolutionIdx < 0) {
                 return null
@@ -1943,6 +1896,13 @@ class MainActivity : AppCompatActivity() {
             )
         } catch (e: Exception) {
             return null
+        } finally {
+            cameraMatrix.release()
+            distCoeffs.release()
+            objectPoints.release()
+            imagePts.release()
+            for (r in rvecs) r.release()
+            for (t in tvecs) t.release()
         }
     }
 
@@ -2035,21 +1995,23 @@ class MainActivity : AppCompatActivity() {
         private const val OFFSET_PREFS_NAME = "qryaw_offsets"
         private const val OFFSET_KEY_PREFIX = "offset_"
         private const val OFFSET_MODE_KEY_PREFIX = "offset_mode_"
-
-        private fun vec3Scale(v: FloatArray, s: kotlin.Float): FloatArray {
+        private const val HALF_QR_SIZE = 0.05
+        private const val FLOOR_UP_VECTOR_VERTICAL_LIMIT = 0.65
+        private const val FLOOR_REPROJECTION_GATE_PX = 3.0
+        private fun vec3Scale(v: FloatArray, s: Float): FloatArray {
             return floatArrayOf(v[0] * s, v[1] * s, v[2] * s)
         }
 
-        private fun vec3Dot(a: FloatArray, b: FloatArray): kotlin.Float {
+        private fun vec3Dot(a: FloatArray, b: FloatArray): Float {
             return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
         }
 
-        private fun vec3Len(v: FloatArray): kotlin.Float {
+        private fun vec3Len(v: FloatArray): Float {
             return sqrt(vec3Dot(v, v).toDouble()).toFloat()
         }
 
         private fun vec3Normalize(v: FloatArray): FloatArray {
-            val len: kotlin.Float = vec3Len(v)
+            val len: Float = vec3Len(v)
             return if (len < 1e-6f) floatArrayOf(0f, 0f, 0f) else vec3Scale(v, 1f / len)
         }
 
@@ -2132,9 +2094,10 @@ class MainActivity : AppCompatActivity() {
             cy: Float
         ): FloatArray {
             val w = v[2]
-            val x = (v[0] - w * cx) / fx
-            val y = (v[1] - w * cy) / fy
-            return vec3Normalize(floatArrayOf(x, -y, -w))
+            if (abs(w) < 1e-6f) return floatArrayOf(0f, 0f, 0f)
+            val x = (v[0] / w - cx) / fx
+            val y = (v[1] / w - cy) / fy
+            return vec3Normalize(floatArrayOf(x, -y, -1f))
         }
     }
 }

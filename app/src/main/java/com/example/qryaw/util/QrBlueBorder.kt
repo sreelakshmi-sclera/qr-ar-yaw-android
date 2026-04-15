@@ -1,4 +1,4 @@
-package com.example.qryaw
+package com.example.qryaw.util
 
 import android.content.Context
 import android.graphics.Canvas
