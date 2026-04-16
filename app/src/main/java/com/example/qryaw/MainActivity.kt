@@ -2,23 +2,22 @@ package com.example.qryaw
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.Image
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.ExperimentalGetImage
 import androidx.core.content.ContextCompat
 import com.example.qryaw.databinding.ActivityMainBinding
 import com.google.android.gms.location.DeviceOrientation
@@ -26,7 +25,6 @@ import com.google.android.gms.location.DeviceOrientationListener
 import com.google.android.gms.location.DeviceOrientationRequest
 import com.google.android.gms.location.FusedOrientationProviderClient
 import com.google.android.gms.location.LocationServices
-import com.google.android.gms.tasks.OnFailureListener
 import com.google.android.gms.tasks.OnSuccessListener
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.ArCoreApk.Availability
@@ -37,7 +35,6 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.king.wechat.qrcode.WeChatQRCodeDetector
-import io.github.sceneview.ar.ARSceneView
 import org.opencv.OpenCV
 import org.opencv.calib3d.Calib3d
 import org.opencv.core.CvType
@@ -151,7 +148,6 @@ open class MainActivity : AppCompatActivity() {
     private class SamplingSession(
         val id: Long,
         val payload: String?,
-        val purpose: SamplingPurpose?,
         val startedAtMs: Long
     ) {
         var lockedMethod: String? = null
@@ -386,7 +382,13 @@ open class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
         timeoutHandler.postDelayed(timeoutRunnable, 15_000L)
         isValidateMode = intent.getBooleanExtra("validate_mode", false)
-        if (isValidateMode) binding.blueBorder.visibility = View.GONE
+        if (isValidateMode) {
+            binding.blueBorder.visibility = View.GONE
+            binding.textView.visibility = View.GONE
+        } else {
+            binding.blueBorder.visibility = View.VISIBLE
+            binding.textView.visibility = View.VISIBLE
+        }
         OpenCV.initOpenCV()
         WeChatQRCodeDetector.init(this)
         backCameraSensorOrientationDegrees = resolveBackCameraSensorOrientation()
@@ -521,7 +523,6 @@ open class MainActivity : AppCompatActivity() {
             lastPayload = payload
         }
         startSampling(
-            if (isValidateMode) SamplingPurpose.VALIDATE else SamplingPurpose.REGISTER,
             payload
         )
     }
@@ -597,7 +598,7 @@ open class MainActivity : AppCompatActivity() {
         resetSamplingStateLocked()
     }
 
-    private fun startSampling(p: SamplingPurpose?, payloadSnapshot: String?) {
+    private fun startSampling(payloadSnapshot: String?) {
         if (payloadSnapshot == null) {
             return
         }
@@ -607,14 +608,12 @@ open class MainActivity : AppCompatActivity() {
             activeSamplingSession = SamplingSession(
                 nextSamplingSessionId++,
                 payloadSnapshot,
-                p,
                 System.currentTimeMillis()
             )
             isSampling = true
             isCollectingMag = true
         }
 
-        val action = if (p == SamplingPurpose.REGISTER) "Registering" else "Validating"
     }
 
     private fun collectSampleWithPose(
@@ -831,37 +830,19 @@ open class MainActivity : AppCompatActivity() {
         lastMeasurementMethod = null
         samplingOffsetAnchor = Double.NaN
         committedPayload = payload
-
-        Log.d(
-            TAG, "commitReading: purpose=${session.purpose} payload=$payload" +
-                    " rawYaw=$inputYaw rawPitch=$inputPitch rawRoll=$inputRoll" +
-                    " → finalYaw=$finalNorthYaw finalPitch=$finalPitch finalRoll=$finalRoll" +
-                    " method=${session.lockedMethod} absoluteNorth=$isAbsoluteNorth" +
-                    " sensorOrientation=$backCameraSensorOrientationDegrees"
-        )
-        if (session.purpose == SamplingPurpose.REGISTER) {
-            val resultIntent = android.content.Intent().apply {
-                putExtra("url", payload)
-                putExtra("yaw", finalNorthYaw)
-                putExtra("pitch", finalPitch)
-                putExtra("roll", finalRoll)
-            }
-            runOnUiThread {
-                setResult(RESULT_OK, resultIntent)
-                timeoutHandler.removeCallbacks(timeoutRunnable)
-                stopFOP()
-                finish()
-            }
-        } else {
-            val storedOffset = readStoredRelativeOffset(payload)
-            if (storedOffset != null && !offsetUsed.isNaN()) {
-                val offsetDelta = abs(angleDifference(storedOffset, offsetUsed))
-                val offsetDrifted = offsetDelta > 10.0
-            }
-            timeoutHandler.postDelayed({
-                synchronized(samplingLock) { committedPayload = null }
-            }, 2000)
+        val resultIntent = Intent().apply {
+            putExtra("url", payload)
+            putExtra("yaw", finalNorthYaw)
+            putExtra("pitch", finalPitch)
+            putExtra("roll", finalRoll)
         }
+        runOnUiThread {
+            setResult(RESULT_OK, resultIntent)
+            timeoutHandler.removeCallbacks(timeoutRunnable)
+            stopFOP()
+            finish()
+        }
+
     }
 
     private fun computeQRYawFromTopEdgeWithPose(
@@ -1214,7 +1195,7 @@ open class MainActivity : AppCompatActivity() {
     }
 
     private fun scanQrFromArFrame(frame: Frame) {
-        var cameraImage: android.media.Image? = null
+        var cameraImage: Image? = null
         try {
             cameraImage = frame.acquireCameraImage()
             val capturedImageTimestampNs = cameraImage.timestamp
@@ -1577,10 +1558,9 @@ open class MainActivity : AppCompatActivity() {
                 1.0
             return QRMeasurement(bestYaw, bestPitch, bestRoll, confidence, method, useDirect)
         } catch (e: Exception) {
-            Log.e(TAG, "computeFloorYawWithSolvePnP failed", e)
+            e.printStackTrace()
             return null
         } finally {
-            // BUG #3 FIX: Always release all native Mats
             cameraMatrix.release()
             distCoeffs.release()
             objectPoints.release()
