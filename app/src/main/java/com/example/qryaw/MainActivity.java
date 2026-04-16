@@ -5,7 +5,6 @@ import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.hardware.GeomagneticField;
-import android.hardware.SensorManager;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.os.Bundle;
@@ -17,6 +16,7 @@ import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
@@ -39,21 +39,15 @@ import com.google.ar.core.TrackingState;
 import com.king.wechat.qrcode.WeChatQRCodeDetector;
 
 import org.opencv.OpenCV;
-import org.opencv.calib3d.Calib3d;
-import org.opencv.core.CvType;
 import org.opencv.core.Mat;
-import org.opencv.core.MatOfDouble;
 import org.opencv.core.MatOfPoint2f;
-import org.opencv.core.MatOfPoint3f;
 import org.opencv.core.Point;
-import org.opencv.core.Point3;
 import org.opencv.core.Size;
 import org.opencv.core.TermCriteria;
 import org.opencv.imgproc.Imgproc;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -71,14 +65,13 @@ public class MainActivity extends AppCompatActivity {
 
     // ── Configuration Constants ──
     private static final int REQUIRED_SAMPLES = 8;
-    private static final double MIN_SAMPLE_WEIGHT = 0.15;
-    private static final double YAW_TOLERANCE = 30.0;   // Loose: Absorbs magnetic drift
+    private static final double MIN_SAMPLE_WEIGHT = 0.05;
+    private static final double YAW_TOLERANCE = 30.0; // Loose: Absorbs magnetic drift
     private static final double PITCH_TOLERANCE = 20.0; // Tight: Gravity is stable
-    private static final double ROLL_TOLERANCE = 20.0;  // Tight: PnP optics are stable
+    private static final double ROLL_TOLERANCE = 20.0; // Tight: PnP optics are stable
     private static final float HEADING_ERROR_GATE = 90.0f;
-    private static final int MAG_SAMPLES_REQUIRED = 15;
-    private static final long MAX_SAMPLE_GAP_MS = 400;
-    private static final long QR_LOST_TIMEOUT_MS = 500;
+    private static final long MAX_SAMPLE_GAP_MS = 1000;
+    private static final long QR_LOST_TIMEOUT_MS = 1500;
     private static final int SUBPIX_WINDOW_RADIUS = 5;
     private static final int SUBPIX_MAX_ITER = 20;
     private static final double SUBPIX_EPSILON = 0.03;
@@ -86,21 +79,33 @@ public class MainActivity extends AppCompatActivity {
     private static final int MAX_FOP_HISTORY_SAMPLES = 128;
     private static final long MAX_FOP_INTERPOLATION_SPAN_NS = 75_000_000L;
     private static final long MAX_FOP_NEAREST_SAMPLE_AGE_NS = 50_000_000L;
+    // Hard freshness cap for the unconditional `latest` FOP fallback.
+    // If lastFopSample is older than this, treat it as no FOP rather than
+    // poisoning the wall yaw with a 15–19 second stale compass heading.
+    private static final long MAX_FOP_LATEST_FALLBACK_AGE_NS = 500_000_000L; // 500 ms
     private static final double DIRECT_METHOD_OUTLIER_THRESHOLD_DEG = 8.0;
     private static final double DIRECT_SAMPLE_RESET_CONFIDENCE = 0.85;
-    private static final double DIRECT_REPROJECTION_CONFIDENCE_SCALE_PX = 1.2;
-    private static final double WALL_DIRECT_REPROJECTION_GATE_PX = 1.8;
-    private static final double WALL_AMBIGUITY_YAW_SPLIT_DEG = 4.0;
-    private static final double WALL_AMBIGUITY_MAX_SCORE_MARGIN = 0.20;
-    private static final int WALL_EARLY_SAMPLE_CAP_COUNT = 2;
-    private static final double WALL_EARLY_SAMPLE_CONFIDENCE_CAP = 0.70;
     private static final double PITCH_OUTLIER_THRESHOLD_DEG = 20.0;
-    private static final int NON_DIRECT_FALLBACKS_BEFORE_MAG = 3;
-    private static final double WALL_BACKFACING_PENALTY = 1000.0;
-    private static final double WALL_CONTINUITY_PENALTY_PER_DEG = 0.01;
     private static final String OFFSET_PREFS_NAME = "qryaw_offsets";
     private static final String OFFSET_KEY_PREFIX = "offset_";
     private static final String OFFSET_MODE_KEY_PREFIX = "offset_mode_";
+    private static final double UNIFIED_WALL_FLOOR_THRESHOLD = 0.15;
+    // Bootstrap: require N provisional samples before trusting any anchor
+    private static final int BOOTSTRAP_REQUIRED = 3;
+    private static final double BOOTSTRAP_YAW_SPREAD_DEG = 10.0;
+    private static final double BOOTSTRAP_PITCH_SPREAD_DEG = 15.0;
+    private static final double BOOTSTRAP_ROLL_SPREAD_DEG = 10.0;
+    // QR frame-quality gate thresholds
+    private static final double QR_MIN_EDGE_PX = 20.0;
+    private static final double QR_MIN_AREA_PX2 = 400.0;
+    private static final double QR_MIN_EDGE_RATIO = 0.3;
+    private static final double QR_MAX_SUBPIX_SHIFT_PX = 6.0;
+    // Canonical yaw continuity gate
+    private static final int CANONICAL_YAW_HISTORY_SIZE = 5;
+    private static final double CANONICAL_YAW_SPIKE_THRESHOLD_DEG = 45.0;
+    // Set to true to enable per-frame diagnostic logs (noisy, ~30/sec)
+    private static final boolean VERBOSE_FRAME_LOGS = false;
+
 
     // ── UI Components ──
     private ARSceneView arSceneView;
@@ -111,11 +116,7 @@ public class MainActivity extends AppCompatActivity {
 
     // ── Runtime State ──
     private String magSamplesDisplay = null;
-    private final List<Double> magValidationBuffer = new ArrayList<>();
-    private String lastMeasurementMethod = null;
-    private volatile boolean isCollectingMag = false;
-    private double samplingOffsetAnchor = Double.NaN;
-    private volatile double lastRawMagHeading = Double.NaN;
+
     private volatile TimedAttitude lastFopSample = null;
     private volatile String lastPayload;
     private volatile QRDatabaseHelper.Registration currentRegistration;
@@ -127,10 +128,9 @@ public class MainActivity extends AppCompatActivity {
     private long lastQrSeenTime = 0;
     private long lastSubPixLogTime = 0;
     private final AtomicBoolean isProcessingFrame = new AtomicBoolean(false);
-    private int backCameraSensorOrientationDegrees = 90;
-    private int consecutiveNonDirectFallbacks = 0;
     private long nextSamplingSessionId = 1L;
     private SamplingSession activeSamplingSession = null;
+    private final ArrayDeque<Double> recentCanonicalYaws = new ArrayDeque<>();
 
     private final ExecutorService qrExecutor = Executors.newSingleThreadExecutor();
     private ExecutorService fopExecutor;
@@ -145,13 +145,21 @@ public class MainActivity extends AppCompatActivity {
     private FusedOrientationProviderClient fusedOrientationClient;
     private FusedLocationProviderClient locationClient;
 
-    private enum SamplingPurpose {REGISTER, VALIDATE}
+    private enum SamplingPurpose {
+        REGISTER, VALIDATE
+    }
 
-    private enum ScanMode {REGISTER, VALIDATE}
+    private enum ScanMode {
+        REGISTER, VALIDATE
+    }
 
-    private enum InfoSource {DATABASE, FRESH_REGISTER}
+    private enum InfoSource {
+        DATABASE, FRESH_REGISTER
+    }
 
-    private enum OffsetMode {RELATIVE, ABSOLUTE, UNKNOWN}
+    private enum OffsetMode {
+        RELATIVE, ABSOLUTE, UNKNOWN
+    }
 
     // ── Inner Data Classes ──
     private static class YawSample {
@@ -229,7 +237,8 @@ public class MainActivity extends AppCompatActivity {
         final double tolerance;
         final boolean withinTolerance;
 
-        ValidationSummary(double yawDelta, double pitchDelta, double rollDelta, double tolerance, boolean withinTolerance) {
+        ValidationSummary(double yawDelta, double pitchDelta, double rollDelta, double tolerance,
+                          boolean withinTolerance) {
             this.yawDelta = yawDelta;
             this.pitchDelta = pitchDelta;
             this.rollDelta = rollDelta;
@@ -246,13 +255,41 @@ public class MainActivity extends AppCompatActivity {
         String lockedMethod;
         String lockedMethodFamily;
         Boolean absoluteNorth;
-        double offsetAnchor = Double.NaN;
+        // Bootstrap: collect provisional samples before trusting any anchor
+        final List<QRMeasurement> provisionalBuffer = new ArrayList<>();
+        boolean bootstrapPromoted = false;
+        String lockedSubtype = null; // exact method locked after bootstrap (e.g. "unified-wall")
 
         SamplingSession(long id, String payload, SamplingPurpose purpose, long startedAtMs) {
             this.id = id;
             this.payload = payload;
             this.purpose = purpose;
             this.startedAtMs = startedAtMs;
+        }
+    }
+
+    private static class QRFrameQuality {
+        final double topEdge, bottomEdge, leftEdge, rightEdge;
+        final double minEdge;
+        final double ratioTB, ratioLR;
+        final double area;
+        final double avgShift, maxShift;
+        final boolean convex;
+
+        QRFrameQuality(double topEdge, double bottomEdge, double leftEdge, double rightEdge,
+                       double minEdge, double ratioTB, double ratioLR,
+                       double area, double avgShift, double maxShift, boolean convex) {
+            this.topEdge = topEdge;
+            this.bottomEdge = bottomEdge;
+            this.leftEdge = leftEdge;
+            this.rightEdge = rightEdge;
+            this.minEdge = minEdge;
+            this.ratioTB = ratioTB;
+            this.ratioLR = ratioLR;
+            this.area = area;
+            this.avgShift = avgShift;
+            this.maxShift = maxShift;
+            this.convex = convex;
         }
     }
 
@@ -265,6 +302,7 @@ public class MainActivity extends AppCompatActivity {
         lastPayload = null;
         currentRegistration = null;
         resetSamplingState();
+        recentCanonicalYaws.clear();
         lastDetectedCorners = null;
         lastQrSeenTime = 0;
         isProcessingFrame.set(false);
@@ -311,93 +349,23 @@ public class MainActivity extends AppCompatActivity {
         return new DeviceOrientationListener() {
             @SuppressLint("SetTextI18n")
             @Override
-            public void onDeviceOrientationChanged(DeviceOrientation orientation) {
+            public void onDeviceOrientationChanged(@NonNull DeviceOrientation orientation) {
                 if (!isFopRegistered || generation != activeFopGeneration) {
                     return;
                 }
 
                 float headingError = orientation.getHeadingErrorDegrees();
-
-                if (headingError == 180.0f || headingError > HEADING_ERROR_GATE) {
-                    if (isCollectingMag) {
-                        runOnUiThread(() -> showStatus(
-                                String.format(Locale.US, "⚠️ Compass interference (Error: %.1f°).\nPlease move phone in a figure-8.", headingError)
-                        ));
-                    }
-                    return;
-                }
-
-                float[] attitude = orientation.getAttitude();
-                if (attitude.length >= 4) {
-                    float[] normalizedAttitude = normalizeQuaternionCopy(attitude);
-                    if (normalizedAttitude != null) {
-                        long sampleElapsedRealtimeNs = orientation.getElapsedRealtimeNs();
-                        lastFopSample = new TimedAttitude(sampleElapsedRealtimeNs, normalizedAttitude.clone());
-                        addFopAttitudeSample(sampleElapsedRealtimeNs, normalizedAttitude);
-                    }
-                }
-
-                runOnUiThread(() -> {
-                    if (!isFopRegistered || generation != activeFopGeneration) {
-                        return;
-                    }
-
-                    lastRawMagHeading = getCameraHeadingDegrees(orientation);
-
-                    if (isCollectingMag) {
-                        SamplingSession session = activeSamplingSession;
-                        if (!isSampling || session == null) {
-                            isCollectingMag = false;
-                            return;
-                        }
-
-                        Frame frame = arSceneView.getFrame();
-                        if (frame == null || frame.getCamera().getTrackingState() != TrackingState.TRACKING)
-                            return;
-
-                        // Camera-forward offset (used only for wall QR)
-                        double arYaw = getARCameraYawDegrees(frame);
-                        double targetOffset = (lastRawMagHeading - arYaw + 360.0) % 360.0;
-
-                        magValidationBuffer.add(targetOffset);
-
-                        dbBadge.setText("🧭 Mag Samples: " + magValidationBuffer.size() + "/" + MAG_SAMPLES_REQUIRED);
-
-                        if (magValidationBuffer.size() >= MAG_SAMPLES_REQUIRED) {
-                            isCollectingMag = false;
-                            StringBuilder sb = new StringBuilder("\n===10 MAG SAMPLES CAPTURED ===\n");
-                            for (int i = 0; i < magValidationBuffer.size(); i++) {
-                                sb.append(String.format(Locale.US, "Mag Sample #%02d: %.2f°\n", i + 1, magValidationBuffer.get(i)));
-                            }
-                            Log.i(TAG, sb.toString());
-
-                            StringBuilder uiSb = new StringBuilder("🧲 10 MAG SAMPLES:\n");
-                            for (int i = 0; i < magValidationBuffer.size(); i++) {
-                                uiSb.append(String.format(Locale.US, "%5.1f°", magValidationBuffer.get(i)));
-                                if (i < magValidationBuffer.size() - 1) uiSb.append(", ");
-                                if ((i + 1) % 5 == 0 && i != magValidationBuffer.size() - 1) {
-                                    uiSb.append("\n");
-                                }
-                            }
-                            magSamplesDisplay = uiSb.toString();
-
-                            List<Double> filteredMagSamples = filterCircularOutliers(magValidationBuffer);
-                            samplingOffsetAnchor = circularMeanDegrees(filteredMagSamples);
-                            session.offsetAnchor = samplingOffsetAnchor;
-
-                            showStatus("📐 North locked. Measuring QR...");
-                            dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
-
-                            int rejectedSamples = magValidationBuffer.size() - filteredMagSamples.size();
-                            if (rejectedSamples > 0) {
-                                log(String.format(Locale.US,
-                                        "Filtered %d/%d magnetic outliers before averaging",
-                                        rejectedSamples, magValidationBuffer.size()));
-                            }
-                            log("Averaged " + filteredMagSamples.size() + " mag samples. Final Anchor = " + String.format(Locale.US, "%.2f°", samplingOffsetAnchor));
+                if (headingError <= HEADING_ERROR_GATE) {
+                    float[] attitude = orientation.getAttitude();
+                    if (attitude.length >= 4) {
+                        float[] normalizedAttitude = normalizeQuaternionCopy(attitude);
+                        if (normalizedAttitude != null) {
+                            long sampleElapsedRealtimeNs = orientation.getElapsedRealtimeNs();
+                            lastFopSample = new TimedAttitude(sampleElapsedRealtimeNs, normalizedAttitude.clone());
+                            addFopAttitudeSample(sampleElapsedRealtimeNs, normalizedAttitude);
                         }
                     }
-                });
+                }
             }
         };
     }
@@ -406,7 +374,7 @@ public class MainActivity extends AppCompatActivity {
     // Vector Math Helpers
     // ─────────────────────────────────────────────────────────────────────────
     private static float[] vec3Scale(float[] v, float s) {
-        return new float[]{v[0] * s, v[1] * s, v[2] * s};
+        return new float[] { v[0] * s, v[1] * s, v[2] * s };
     }
 
     private static float vec3Dot(float[] a, float[] b) {
@@ -419,11 +387,11 @@ public class MainActivity extends AppCompatActivity {
 
     private static float[] vec3Normalize(float[] v) {
         float len = vec3Len(v);
-        return (len < 1e-6f) ? new float[]{0, 0, 0} : vec3Scale(v, 1f / len);
+        return (len < 1e-6f) ? new float[] { 0, 0, 0 } : vec3Scale(v, 1f / len);
     }
 
     private static float[] vec3Cross(float[] a, float[] b) {
-        return new float[]{
+        return new float[] {
                 a[1] * b[2] - a[2] * b[1],
                 a[2] * b[0] - a[0] * b[2],
                 a[0] * b[1] - a[1] * b[0]
@@ -431,7 +399,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private static float[] rotateCamToWorld(float[] camVec, float[] m) {
-        return new float[]{
+        return new float[] {
                 m[0] * camVec[0] + m[4] * camVec[1] + m[8] * camVec[2],
                 m[1] * camVec[0] + m[5] * camVec[1] + m[9] * camVec[2],
                 m[2] * camVec[0] + m[6] * camVec[1] + m[10] * camVec[2]
@@ -441,7 +409,8 @@ public class MainActivity extends AppCompatActivity {
     private int resolveBackCameraSensorOrientation() {
         try {
             CameraManager cameraManager = getSystemService(CameraManager.class);
-            if (cameraManager == null) return 90;
+            if (cameraManager == null)
+                return 90;
 
             for (String cameraId : cameraManager.getCameraIdList()) {
                 CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
@@ -461,39 +430,6 @@ public class MainActivity extends AppCompatActivity {
         return 90;
     }
 
-    private float[] mapOpenCvCameraVectorToDeviceFrame(double camX, double camY, double camZ) {
-        int orientation = ((backCameraSensorOrientationDegrees % 360) + 360) % 360;
-
-        float deviceX;
-        float deviceY;
-
-        switch (orientation) {
-            case 0:
-                deviceX = (float) camX;
-                deviceY = (float) -camY;
-                break;
-            case 90:
-                deviceX = (float) -camY;
-                deviceY = (float) -camX;
-                break;
-            case 180:
-                deviceX = (float) -camX;
-                deviceY = (float) camY;
-                break;
-            case 270:
-                deviceX = (float) camY;
-                deviceY = (float) camX;
-                break;
-            default:
-                Log.w(TAG, "Unexpected sensor orientation " + orientation + "°, assuming 90° mapping");
-                deviceX = (float) -camY;
-                deviceY = (float) -camX;
-                break;
-        }
-
-        return new float[]{deviceX, deviceY, (float) -camZ};
-    }
-
     private void addFopAttitudeSample(long elapsedRealtimeNs, float[] attitude) {
         synchronized (fopHistoryLock) {
             fopAttitudeHistory.addLast(new TimedAttitude(elapsedRealtimeNs, attitude.clone()));
@@ -511,16 +447,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private static float[] normalizeQuaternionCopy(float[] quaternion) {
-        if (quaternion == null || quaternion.length < 4) return null;
+        if (quaternion == null || quaternion.length < 4)
+            return null;
 
         double norm = Math.sqrt(
                 quaternion[0] * quaternion[0]
                         + quaternion[1] * quaternion[1]
                         + quaternion[2] * quaternion[2]
                         + quaternion[3] * quaternion[3]);
-        if (norm < 1e-9) return null;
+        if (norm < 1e-9)
+            return null;
 
-        return new float[]{
+        return new float[] {
                 (float) (quaternion[0] / norm),
                 (float) (quaternion[1] / norm),
                 (float) (quaternion[2] / norm),
@@ -531,12 +469,13 @@ public class MainActivity extends AppCompatActivity {
     private static float[] slerpQuaternion(float[] q0, float[] q1, double alpha) {
         float[] start = normalizeQuaternionCopy(q0);
         float[] end = normalizeQuaternionCopy(q1);
-        if (start == null || end == null) return null;
+        if (start == null || end == null)
+            return null;
 
         double dot = start[0] * end[0] + start[1] * end[1] + start[2] * end[2] + start[3] * end[3];
         if (dot < 0.0) {
             dot = -dot;
-            end = new float[]{-end[0], -end[1], -end[2], -end[3]};
+            end = new float[] { -end[0], -end[1], -end[2], -end[3] };
         }
 
         if (dot > 0.9995) {
@@ -558,7 +497,7 @@ public class MainActivity extends AppCompatActivity {
         double s0 = Math.sin(theta0 - theta) / sinTheta0;
         double s1 = sinTheta / sinTheta0;
 
-        return new float[]{
+        return new float[] {
                 (float) (s0 * start[0] + s1 * end[0]),
                 (float) (s0 * start[1] + s1 * end[1]),
                 (float) (s0 * start[2] + s1 * end[2]),
@@ -567,10 +506,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private ResolvedFopAttitude resolveFopAttitudeAt(long targetTimestampNs, String strategyBase) {
-        if (targetTimestampNs <= 0) return null;
+        if (targetTimestampNs <= 0)
+            return null;
 
         synchronized (fopHistoryLock) {
-            if (fopAttitudeHistory.isEmpty()) return null;
+            if (fopAttitudeHistory.isEmpty())
+                return null;
 
             TimedAttitude prev = null;
             TimedAttitude next = null;
@@ -639,13 +580,24 @@ public class MainActivity extends AppCompatActivity {
 
     private ResolvedFopAttitude resolveFopAttitudeForFrame(long imageTimestampNs, long acquireElapsedRealtimeNs) {
         ResolvedFopAttitude resolved = resolveFopAttitudeAt(imageTimestampNs, "image");
-        if (resolved != null) return resolved;
+        if (resolved != null)
+            return resolved;
 
         resolved = resolveFopAttitudeAt(acquireElapsedRealtimeNs, "acquire");
-        if (resolved != null) return resolved;
+        if (resolved != null)
+            return resolved;
 
         TimedAttitude latestSample = lastFopSample;
-        if (latestSample == null) return null;
+        if (latestSample == null)
+            return null;
+
+        long latestAgeNs = Math.abs(acquireElapsedRealtimeNs - latestSample.elapsedRealtimeNs);
+        if (latestAgeNs > MAX_FOP_LATEST_FALLBACK_AGE_NS) {
+            Log.w(TAG, String.format(Locale.US,
+                    "[resolveFop] latest FOP sample is %.0f ms old — rejecting stale fallback",
+                    latestAgeNs / 1_000_000.0));
+            return null;
+        }
 
         return new ResolvedFopAttitude(
                 latestSample.attitude.clone(),
@@ -657,8 +609,8 @@ public class MainActivity extends AppCompatActivity {
     // ─────────────────────────────────────────────────────────────────────────
     // Lifecycle & Permissions
     // ─────────────────────────────────────────────────────────────────────────
-    private final ActivityResultLauncher<String[]> permissionLauncher =
-            registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), permissions -> {
+    private final ActivityResultLauncher<String[]> permissionLauncher = registerForActivityResult(
+            new ActivityResultContracts.RequestMultiplePermissions(), permissions -> {
                 Boolean cameraGranted = permissions.getOrDefault(Manifest.permission.CAMERA, false);
                 if (cameraGranted != null && cameraGranted) {
                     checkArCoreAndStart();
@@ -692,7 +644,7 @@ public class MainActivity extends AppCompatActivity {
 
         OpenCV.initOpenCV();
         WeChatQRCodeDetector.init(this);
-        backCameraSensorOrientationDegrees = resolveBackCameraSensorOrientation();
+        int backCameraSensorOrientationDegrees = resolveBackCameraSensorOrientation();
         log("Back camera sensor orientation: " + backCameraSensorOrientationDegrees + "°");
 
         log("DB path: " + QRDatabaseHelper.getInstance(this).getDatabasePath());
@@ -706,13 +658,13 @@ public class MainActivity extends AppCompatActivity {
             return null;
         });
 
-        boolean hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED;
+        boolean hasCamera = ContextCompat.checkSelfPermission(this,
+                Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
 
         if (hasCamera) {
             checkArCoreAndStart();
         } else {
-            permissionLauncher.launch(new String[]{
+            permissionLauncher.launch(new String[] {
                     Manifest.permission.CAMERA,
                     Manifest.permission.ACCESS_FINE_LOCATION,
                     Manifest.permission.ACCESS_COARSE_LOCATION
@@ -756,7 +708,8 @@ public class MainActivity extends AppCompatActivity {
 
     @SuppressLint("MissingPermission")
     private void startFOP() {
-        if (fusedOrientationClient == null) return;
+        if (fusedOrientationClient == null)
+            return;
         if (isFopRegistered) {
             log("FOP already started; skipping duplicate registration.");
             return;
@@ -774,18 +727,17 @@ public class MainActivity extends AppCompatActivity {
                                 (float) location.getLatitude(),
                                 (float) location.getLongitude(),
                                 (float) location.getAltitude(),
-                                System.currentTimeMillis()
-                        );
+                                System.currentTimeMillis());
                         float declination = field.getDeclination();
-                        log("Location secured. Magnetic Declination is: " + String.format(Locale.US, "%.2f°", declination));
+                        log("Location secured. Magnetic Declination is: "
+                                + String.format(Locale.US, "%.2f°", declination));
                     } else {
                         log("⚠️ Location is null. FOP may temporarily fall back to Magnetic North.");
                     }
                 });
 
         DeviceOrientationRequest request = new DeviceOrientationRequest.Builder(
-                DeviceOrientationRequest.OUTPUT_PERIOD_FAST
-        ).build();
+                DeviceOrientationRequest.OUTPUT_PERIOD_FAST).build();
 
         fusedOrientationClient
                 .requestOrientationUpdates(request, ensureFopExecutor(), listener)
@@ -818,8 +770,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void resetAlignment() {
-        samplingOffsetAnchor = Double.NaN;
-        lastRawMagHeading = Double.NaN;
         clearFopHistory();
     }
 
@@ -862,7 +812,8 @@ public class MainActivity extends AppCompatActivity {
 
         arSceneView.setOnFrame(frameTime -> {
             Frame frame = arSceneView.getFrame();
-            if (frame == null) return Unit.INSTANCE;
+            if (frame == null)
+                return Unit.INSTANCE;
 
             if (frame.getCamera().getTrackingState() == TrackingState.TRACKING) {
                 if (isAlignmentReady() && lastPayload != null) {
@@ -889,7 +840,8 @@ public class MainActivity extends AppCompatActivity {
             abortActiveSampling("QR changed during sampling. Try again.");
         }
 
-        if (payload.equals(lastPayload)) return;
+        if (payload.equals(lastPayload))
+            return;
         lastPayload = payload;
         currentRegistration = null;
 
@@ -926,7 +878,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private boolean isAlignmentReady() {
-        return !Double.isNaN(lastRawMagHeading);
+        return lastFopSample != null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -945,7 +897,8 @@ public class MainActivity extends AppCompatActivity {
             showStatus("⚠️ QR payload not decoded yet.");
             return;
         }
-        if (isSampling) return;
+        if (isSampling)
+            return;
         startSampling(SamplingPurpose.REGISTER, lastPayload);
     }
 
@@ -969,11 +922,13 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (!hasFullOrientation(record)) {
-            showStatus("⚠️ This QR was registered before pitch/roll tracking was added.\nPress REGISTER to save full orientation again.");
+            showStatus(
+                    "⚠️ This QR was registered before pitch/roll tracking was added.\nPress REGISTER to save full orientation again.");
             setMode(ScanMode.REGISTER);
             return;
         }
-        if (isSampling) return;
+        if (isSampling)
+            return;
         startSampling(SamplingPurpose.VALIDATE, lastPayload);
     }
 
@@ -987,7 +942,8 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        List<QRDatabaseHelper.Validation> validations = QRDatabaseHelper.getInstance(this).fetchValidations(lastPayload, 20);
+        List<QRDatabaseHelper.Validation> validations = QRDatabaseHelper.getInstance(this).fetchValidations(lastPayload,
+                20);
         List<QRDatabaseHelper.Registration> allRegs = QRDatabaseHelper.getInstance(this).fetchAllRegistrations();
 
         StringBuilder msg = new StringBuilder("═══ REGISTRATION ═══\n");
@@ -1091,9 +1047,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private OffsetMode readStoredOffsetMode(String payload) {
-        if (payload == null) return OffsetMode.UNKNOWN;
+        if (payload == null)
+            return OffsetMode.UNKNOWN;
         String rawValue = getOffsetPreferences().getString(offsetModeKey(payload), null);
-        if (rawValue == null) return OffsetMode.UNKNOWN;
+        if (rawValue == null)
+            return OffsetMode.UNKNOWN;
         try {
             return OffsetMode.valueOf(rawValue);
         } catch (IllegalArgumentException ignored) {
@@ -1102,17 +1060,20 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private Double readStoredRelativeOffset(String payload) {
-        if (payload == null) return null;
+        if (payload == null)
+            return null;
         SharedPreferences prefs = getOffsetPreferences();
         String key = offsetKey(payload);
-        if (!prefs.contains(key)) return null;
+        if (!prefs.contains(key))
+            return null;
 
         float offset = prefs.getFloat(key, Float.NaN);
         return Float.isNaN(offset) ? null : (double) offset;
     }
 
     private void persistOffsetMetadata(String payload, boolean isAbsoluteNorth, double offsetUsed) {
-        if (payload == null) return;
+        if (payload == null)
+            return;
 
         SharedPreferences.Editor editor = getOffsetPreferences().edit()
                 .putString(offsetModeKey(payload),
@@ -1127,7 +1088,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String normalizeMeasurementFamily(String method) {
-        if (method == null) return "unknown";
+        if (method == null)
+            return "unknown";
+
+        if (method.startsWith("unified-")) {
+            return "unified";
+        }
 
         boolean absoluteNorth = isAbsoluteNorthMethod(method);
         if (method.startsWith("wall-")) {
@@ -1139,28 +1105,16 @@ public class MainActivity extends AppCompatActivity {
         return absoluteNorth ? "direct" : "relative";
     }
 
-    private double resolveActiveOffsetAnchor(SamplingSession session) {
-        if (session != null && !Double.isNaN(session.offsetAnchor)) {
-            return session.offsetAnchor;
-        }
-        return samplingOffsetAnchor;
-    }
-
     private void resetSamplingState() {
         sampleBuffer.clear();
-        magValidationBuffer.clear();
         magSamplesDisplay = null;
-        lastMeasurementMethod = null;
         lastSampleTime = 0;
-        consecutiveNonDirectFallbacks = 0;
-        samplingOffsetAnchor = Double.NaN;
         activeSamplingSession = null;
         isSampling = false;
-        isCollectingMag = false;
     }
 
     private void abortActiveSampling(String reason) {
-        if (!isSampling && activeSamplingSession == null && sampleBuffer.isEmpty() && magValidationBuffer.isEmpty()) {
+        if (!isSampling && activeSamplingSession == null && sampleBuffer.isEmpty()) {
             return;
         }
 
@@ -1171,22 +1125,6 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(() -> dbBadge.setText(""));
     }
 
-    private void beginMagAnchorCollection(String reason) {
-        sampleBuffer.clear();
-        magValidationBuffer.clear();
-        magSamplesDisplay = null;
-        lastMeasurementMethod = null;
-        lastSampleTime = 0;
-        consecutiveNonDirectFallbacks = 0;
-        isCollectingMag = true;
-
-        log("[sampling] Starting magnetic north collection: " + reason);
-
-        String action = samplingActionLabel();
-        showStatus(action + "...\nFinding Magnetic North (0/" + MAG_SAMPLES_REQUIRED + ")");
-        dbBadge.setText("Mag Init...");
-    }
-
     private void startSampling(SamplingPurpose p, String payloadSnapshot) {
         if (payloadSnapshot == null) {
             showStatus("⚠️ QR payload not decoded yet.");
@@ -1194,6 +1132,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         resetSamplingState();
+        recentCanonicalYaws.clear();
         purpose = p;
         activeSamplingSession = new SamplingSession(
                 nextSamplingSessionId++,
@@ -1201,19 +1140,10 @@ public class MainActivity extends AppCompatActivity {
                 p,
                 System.currentTimeMillis());
         isSampling = true;
-        isCollectingMag = true;
 
         String action = (p == SamplingPurpose.REGISTER) ? "Registering" : "Validating";
-        showStatus("🧭 " + action + "...\nFinding Magnetic North (0/" + MAG_SAMPLES_REQUIRED + ")");
-        dbBadge.setText("🔄 Mag Init...");
-
-        arSceneView.postDelayed(() -> {
-            SamplingSession session = activeSamplingSession;
-            if (!isSampling || session == null || !payloadSnapshot.equals(session.payload)) return;
-            isCollectingMag = true;
-            showStatus("🧭 " + action + "...\nFinding Magnetic North (0/" + MAG_SAMPLES_REQUIRED + ")");
-            dbBadge.setText("🔄 Mag Init...");
-        }, 1500);
+        showStatus("🧭 " + action + "...\nMeasuring orientation...");
+        dbBadge.setText("🔄 QR Sampling 0/" + REQUIRED_SAMPLES);
     }
 
     private void collectSampleWithPose(float[] imagePoints, float[] camPose,
@@ -1221,11 +1151,23 @@ public class MainActivity extends AppCompatActivity {
                                        ResolvedFopAttitude resolvedFopAttitude,
                                        String framePayload) {
         SamplingSession session = activeSamplingSession;
-        if (session == null || !isSampling) return;
+        if (session == null || !isSampling)
+            return;
 
         if (resolvedFopAttitude == null) {
             log("[collectSampleWithPose] Waiting for aligned FOP before accepting samples");
             return;
+        }
+        // Secondary freshness gate: if resolution still returned a `latest` fallback
+        // whose delta exceeds the cap, drop it here as a safety net.
+        if ("latest".equals(resolvedFopAttitude.strategy)) {
+            long ageNs = Math.abs(resolvedFopAttitude.targetTimestampNs - resolvedFopAttitude.referenceTimestampNs);
+            if (ageNs > MAX_FOP_LATEST_FALLBACK_AGE_NS) {
+                log(String.format(Locale.US,
+                        "[collectSampleWithPose] DROPPED: `latest` FOP fallback is %.0f ms old — too stale for production sample",
+                        ageNs / 1_000_000.0));
+                return;
+            }
         }
         if (!isSampling || session == null) {
             log("[collectSampleWithPose] No active sampling session - skipping frame");
@@ -1239,19 +1181,22 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        log("[collectSampleWithPose] Using pre-captured pose. camOrigin=("
-                + String.format(Locale.US, "%.3f, %.3f, %.3f", camPose[12], camPose[13], camPose[14]) + ")");
-        if (resolvedFopAttitude != null) {
-            double syncDeltaMs = Math.abs(resolvedFopAttitude.targetTimestampNs - resolvedFopAttitude.referenceTimestampNs) / 1_000_000.0;
-            log(String.format(Locale.US,
-                    "[collectSampleWithPose] FOP sync strategy=%s delta=%.2fms",
-                    resolvedFopAttitude.strategy,
-                    syncDeltaMs));
-        } else {
-            log("[collectSampleWithPose] No time-aligned FOP sample available");
+        if (VERBOSE_FRAME_LOGS) {
+            log("[collectSampleWithPose] Using pre-captured pose. camOrigin=("
+                    + String.format(Locale.US, "%.3f, %.3f, %.3f", camPose[12], camPose[13], camPose[14]) + ")");
+            if (resolvedFopAttitude != null) {
+                double syncDeltaMs = Math.abs(
+                        resolvedFopAttitude.targetTimestampNs - resolvedFopAttitude.referenceTimestampNs) / 1_000_000.0;
+                log(String.format(Locale.US,
+                        "[collectSampleWithPose] FOP sync strategy=%s delta=%.2fms",
+                        resolvedFopAttitude.strategy,
+                        syncDeltaMs));
+            } else {
+                log("[collectSampleWithPose] No time-aligned FOP sample available");
+            }
         }
 
-        QRMeasurement result = computeQRYawFromTopEdgeWithPose(
+        QRMeasurement result = calculateUnifiedQRMeasurement(
                 imagePoints,
                 camPose,
                 intrinsics,
@@ -1262,14 +1207,17 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        log(String.format(Locale.US, "[collectSampleWithPose] yaw=%.1f° pitch=%.1f° roll=%.1f° conf=%.2f method=%s",
-                result.yaw, result.pitch, result.roll, result.confidence, result.method));
+        if (VERBOSE_FRAME_LOGS) {
+            log(String.format(Locale.US, "[collectSampleWithPose] yaw=%.1f° pitch=%.1f° roll=%.1f° conf=%.2f method=%s",
+                    result.yaw, result.pitch, result.roll, result.confidence, result.method));
+        }
         processSample(result);
     }
 
     private void logSampleBuffer() {
         StringBuilder sb = new StringBuilder();
-        sb.append("\n=== QR NORTH SAMPLES [").append(sampleBuffer.size()).append("/").append(REQUIRED_SAMPLES).append("] ===\n");
+        sb.append("\n=== QR NORTH SAMPLES [").append(sampleBuffer.size()).append("/").append(REQUIRED_SAMPLES)
+                .append("] ===\n");
         sb.append(String.format(Locale.US, "%-6s | %-10s | %-8s | %-8s | %-8s | %-8s\n",
                 "ID", "NORTH", "RAW", "PITCH", "ROLL", "WEIGHT"));
         sb.append("----------------------------------------------------------------\n");
@@ -1300,6 +1248,10 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(() -> infoText.setText(sb.toString()));
     }
 
+    private boolean isAbsoluteNorthMethod(String method) {
+        return method != null && (method.endsWith("-direct") || method.startsWith("unified-"));
+    }
+
     private void processSample(QRMeasurement result) {
         SamplingSession session = activeSamplingSession;
         if (!isSampling || session == null) {
@@ -1308,15 +1260,6 @@ public class MainActivity extends AppCompatActivity {
         }
 
         double sampleConfidence = result.confidence;
-        if (isWallDirectMethod(result.method) && sampleBuffer.size() < WALL_EARLY_SAMPLE_CAP_COUNT) {
-            double cappedConfidence = Math.min(sampleConfidence, WALL_EARLY_SAMPLE_CONFIDENCE_CAP);
-            if (cappedConfidence < sampleConfidence) {
-                log(String.format(Locale.US,
-                        "[processSample] Early wall direct sample confidence capped: raw=%.2f capped=%.2f sampleIndex=%d",
-                        sampleConfidence, cappedConfidence, sampleBuffer.size() + 1));
-                sampleConfidence = cappedConfidence;
-            }
-        }
 
         if (sampleConfidence < MIN_SAMPLE_WEIGHT) {
             log(String.format(Locale.US,
@@ -1336,7 +1279,6 @@ public class MainActivity extends AppCompatActivity {
             session.lockedMethod = result.method;
             session.lockedMethodFamily = sampleMethodFamily;
             session.absoluteNorth = sampleAbsoluteNorth;
-            lastMeasurementMethod = result.method;
             log(String.format(Locale.US,
                     "[processSample] Locked session=%d method=%s family=%s payload=%s",
                     session.id,
@@ -1357,45 +1299,107 @@ public class MainActivity extends AppCompatActivity {
         }
 
         boolean isAbsoluteNorth = Boolean.TRUE.equals(session.absoluteNorth);
-        double activeOffset = resolveActiveOffsetAnchor(session);
 
-        double sampleNorth;
-        if (isAbsoluteNorth) {
-            sampleNorth = result.yaw;
-        } else {
-            if (Double.isNaN(activeOffset)) {
-                sampleNorth = result.yaw;
+        double sampleNorth = result.yaw;
+        double sampleRoll = normalizeDegrees(result.roll);
+
+        // ── Time gap check (applies to both bootstrap and post-bootstrap) ──
+        long now = System.currentTimeMillis();
+        if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
+            if (!session.bootstrapPromoted) {
+                int discarded = session.provisionalBuffer.size();
+                session.provisionalBuffer.clear();
+                log(String.format(Locale.US,
+                        "[bootstrap] Gap %dms > %dms — discarded %d provisional samples, restarting bootstrap",
+                        (now - lastSampleTime), MAX_SAMPLE_GAP_MS, discarded));
             } else {
-                sampleNorth = (result.yaw + activeOffset) % 360.0;
-                if (sampleNorth < 0) sampleNorth += 360.0;
+                int discarded = sampleBuffer.size();
+                sampleBuffer.clear();
+                session.provisionalBuffer.clear();
+                session.bootstrapPromoted = false;
+                session.lockedSubtype = null;
+                log(String.format(Locale.US,
+                        "[bootstrap] Gap %dms > %dms — discarded %d post-bootstrap samples, restarting bootstrap",
+                        (now - lastSampleTime), MAX_SAMPLE_GAP_MS, discarded));
             }
+            runOnUiThread(() -> dbBadge.setText("🔄 Gap detected — resampling 0/" + REQUIRED_SAMPLES));
+        }
+        lastSampleTime = now;
+
+        // ── Bootstrap phase: collect provisional samples before trusting any anchor ──
+        if (!session.bootstrapPromoted) {
+            session.provisionalBuffer.add(result);
+            log(String.format(Locale.US,
+                    "[bootstrap] Provisional sample %d/%d: yaw=%.1f° pitch=%.1f° roll=%.1f° method=%s",
+                    session.provisionalBuffer.size(), BOOTSTRAP_REQUIRED,
+                    result.yaw, result.pitch, result.roll, result.method));
+
+            final int bootCount = session.provisionalBuffer.size();
+            runOnUiThread(() -> dbBadge.setText("🔄 Bootstrap " + bootCount + "/" + BOOTSTRAP_REQUIRED));
+
+            if (session.provisionalBuffer.size() < BOOTSTRAP_REQUIRED) {
+                return;
+            }
+
+            // Evaluate bootstrap stability
+            List<QRMeasurement> promoted = evaluateBootstrap(session.provisionalBuffer);
+            if (promoted == null) {
+                session.provisionalBuffer.clear();
+                log("[bootstrap] RESET: no stable cluster found — restarting bootstrap");
+                runOnUiThread(() -> dbBadge.setText("🔄 Bootstrap reset — resampling"));
+                return;
+            }
+
+            // Lock subtype from promoted samples
+            session.lockedSubtype = promoted.get(0).method;
+            session.bootstrapPromoted = true;
+            log(String.format(Locale.US,
+                    "[bootstrap] PROMOTED %d/%d samples → sampleBuffer, locked subtype=%s",
+                    promoted.size(), session.provisionalBuffer.size(), session.lockedSubtype));
+
+            // Add promoted samples to sampleBuffer
+            for (QRMeasurement m : promoted) {
+                sampleBuffer.add(new YawSample(m.yaw, m.yaw, m.pitch,
+                        normalizeDegrees(m.roll), m.confidence));
+            }
+
+            logSampleBuffer();
+            updateFullSampleListUI();
+
+            final int countAfterPromo = sampleBuffer.size();
+            final String subtypeCopy = session.lockedSubtype;
+            runOnUiThread(() -> dbBadge.setText("🔄 Sampling " + countAfterPromo + "/" + REQUIRED_SAMPLES
+                    + " [" + subtypeCopy + "]"));
+
+            if (sampleBuffer.size() >= REQUIRED_SAMPLES) {
+                completeSampling(session);
+            }
+            return;
         }
 
-        double sampleRoll;
-        if (result.rollAbsolute) {
-            sampleRoll = normalizeDegrees(result.roll);
-        } else {
-            sampleRoll = Double.isNaN(activeOffset)
-                    ? normalizeDegrees(result.roll)
-                    : normalizeDegrees(result.roll + activeOffset);
+        // ── Post-bootstrap: enforce subtype lock ──
+        if (session.lockedSubtype != null && !session.lockedSubtype.equals(result.method)) {
+            log(String.format(Locale.US,
+                    "[processSample] Subtype mismatch after bootstrap lock: session=%d locked=%s incoming=%s — rejected",
+                    session.id, session.lockedSubtype, result.method));
+            return;
         }
 
+        // ── Outlier detection against established buffer ──
         if (!sampleBuffer.isEmpty()) {
-            double yawReference = isAbsoluteNorth
-                    ? circularWeightedMeanNorth(sampleBuffer)
-                    : circularWeightedMeanRaw(sampleBuffer);
-            double yawCompareValue = isAbsoluteNorth ? sampleNorth : result.yaw;
+            double yawReference = circularWeightedMeanNorth(sampleBuffer);
+            double yawCompareValue = sampleNorth;
             double yawDiff = Math.abs(angleDifference(yawReference, yawCompareValue));
             double rollReference = circularWeightedMeanRoll(sampleBuffer);
             double rollDiff = Math.abs(angleDifference(rollReference, sampleRoll));
             double pitchReference = weightedMeanPitch(sampleBuffer);
             double pitchDiff = Math.abs(pitchReference - result.pitch);
-            double outlierThreshold = isAbsoluteNorth
-                    ? DIRECT_METHOD_OUTLIER_THRESHOLD_DEG
-                    : 45.0;
+            boolean isWallLike = "unified-wall".equals(result.method) || "unified-tilted".equals(result.method);
+            double yawOutlierThreshold = isWallLike ? 4.0 : DIRECT_METHOD_OUTLIER_THRESHOLD_DEG;
+            double rollOutlierThreshold = isWallLike ? 6.0 : DIRECT_METHOD_OUTLIER_THRESHOLD_DEG;
 
-            if (yawDiff > outlierThreshold
-                    || rollDiff > outlierThreshold
+            if (yawDiff > yawOutlierThreshold
+                    || rollDiff > rollOutlierThreshold
                     || pitchDiff > PITCH_OUTLIER_THRESHOLD_DEG) {
                 if (sampleConfidence >= DIRECT_SAMPLE_RESET_CONFIDENCE
                         && sampleBuffer.get(0).weight < 0.5) {
@@ -1418,18 +1422,6 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        long now = System.currentTimeMillis();
-        if (lastSampleTime > 0 && (now - lastSampleTime) > MAX_SAMPLE_GAP_MS) {
-            int discarded = sampleBuffer.size();
-            sampleBuffer.clear();
-            log(String.format(Locale.US,
-                    "Sample gap %dms > %dms — discarded %d stale samples, restarting",
-                    (now - lastSampleTime), MAX_SAMPLE_GAP_MS, discarded));
-            runOnUiThread(() ->
-                    dbBadge.setText("🔄 Gap detected — resampling 0/" + REQUIRED_SAMPLES));
-        }
-        lastSampleTime = now;
-
         sampleBuffer.add(new YawSample(result.yaw, sampleNorth, result.pitch, sampleRoll, sampleConfidence));
 
         log(String.format(Locale.US,
@@ -1442,40 +1434,131 @@ public class MainActivity extends AppCompatActivity {
 
         final String methodCopy = result.method;
         final int countCopy = sampleBuffer.size();
-        runOnUiThread(() ->
-                dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES
-                        + " [" + methodCopy + "]"));
+        runOnUiThread(() -> dbBadge.setText("🔄 Sampling " + countCopy + "/" + REQUIRED_SAMPLES
+                + " [" + methodCopy + "]"));
 
         if (sampleBuffer.size() >= REQUIRED_SAMPLES) {
-            isSampling = false;
-
-            StringBuilder sb = new StringBuilder("[processSample] ALL SAMPLES: ");
-            for (int i = 0; i < sampleBuffer.size(); i++) {
-                YawSample s = sampleBuffer.get(i);
-                sb.append(String.format(Locale.US,
-                        "#%d raw=%.1f° north=%.1f° pitch=%.1f° roll=%.1f°(w=%.2f) ",
-                        i + 1, s.yaw, s.northYaw, s.pitch, s.roll, s.weight));
-            }
-            log(sb.toString());
-
-            // Direct FOP methods average absolute north; fallback methods still average raw yaw.
-            // Floor: average north yaws, pass directly
-            double finalYaw;
-            if (isAbsoluteNorth) {
-                finalYaw = circularWeightedMeanNorth(sampleBuffer);
-            } else {
-                finalYaw = circularWeightedMeanRaw(sampleBuffer);
-            }
-            double finalPitch = weightedMeanPitch(sampleBuffer);
-            double finalRoll = circularWeightedMeanRoll(sampleBuffer);
-
-            log(String.format(Locale.US,
-                    "Sampling complete. Averaged %s yaw = %.2f°, pitch = %.2f°, roll = %.2f° from %d samples",
-                    isAbsoluteNorth ? "north" : "raw", finalYaw, finalPitch, finalRoll, sampleBuffer.size()));
-
-            sampleBuffer.clear();
-            commitReading(session, finalYaw, finalPitch, finalRoll);
+            completeSampling(session);
         }
+    }
+
+    private void completeSampling(SamplingSession session) {
+        isSampling = false;
+
+        StringBuilder sb = new StringBuilder("[processSample] ALL SAMPLES: ");
+        for (int i = 0; i < sampleBuffer.size(); i++) {
+            YawSample s = sampleBuffer.get(i);
+            sb.append(String.format(Locale.US,
+                    "#%d raw=%.1f° north=%.1f° pitch=%.1f° roll=%.1f°(w=%.2f) ",
+                    i + 1, s.yaw, s.northYaw, s.pitch, s.roll, s.weight));
+        }
+        log(sb.toString());
+
+        // Direct FOP methods average absolute north; fallback methods still average raw
+        // yaw.
+        // Floor: average north yaws, pass directly
+        double finalYaw = circularWeightedMeanNorth(sampleBuffer);
+        double finalPitch = weightedMeanPitch(sampleBuffer);
+        double finalRoll = circularWeightedMeanRoll(sampleBuffer);
+
+        log(String.format(Locale.US,
+                "Sampling complete. Averaged north yaw = %.2f°, pitch = %.2f°, roll = %.2f° from %d samples",
+                finalYaw, finalPitch, finalRoll, sampleBuffer.size()));
+
+        sampleBuffer.clear();
+        commitReading(session, finalYaw, finalPitch, finalRoll);
+    }
+
+    /**
+     * Evaluates a provisional bootstrap buffer for internal consistency.
+     * Returns the subset of samples to promote, or null if no stable cluster is found.
+     * - If all samples agree: returns all.
+     * - If excluding one sample makes the rest agree (bad seed): returns the agreeing subset.
+     * - If no majority found: returns null (caller should reset bootstrap).
+     */
+    private List<QRMeasurement> evaluateBootstrap(List<QRMeasurement> provisional) {
+        int n = provisional.size();
+
+        // Check unified subtype consistency: all unified-* samples must share the same subtype
+        String subtype = provisional.get(0).method;
+        if (subtype != null && subtype.startsWith("unified-")) {
+            for (QRMeasurement m : provisional) {
+                if (!subtype.equals(m.method)) {
+                    log(String.format(Locale.US,
+                            "[bootstrap] Mixed unified subtypes (%s vs %s) — rejecting set",
+                            subtype, m.method));
+                    return null;
+                }
+            }
+        }
+
+        double[] yaws = new double[n];
+        double[] pitches = new double[n];
+        double[] rolls = new double[n];
+        for (int i = 0; i < n; i++) {
+            yaws[i] = provisional.get(i).yaw;
+            pitches[i] = provisional.get(i).pitch;
+            rolls[i] = normalizeDegrees(provisional.get(i).roll);
+        }
+
+        // Compute pairwise max spread
+        double maxYawSpread = 0, maxPitchSpread = 0, maxRollSpread = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                maxYawSpread = Math.max(maxYawSpread, Math.abs(angleDifference(yaws[i], yaws[j])));
+                maxPitchSpread = Math.max(maxPitchSpread, Math.abs(pitches[i] - pitches[j]));
+                maxRollSpread = Math.max(maxRollSpread, Math.abs(angleDifference(rolls[i], rolls[j])));
+            }
+        }
+
+        log(String.format(Locale.US,
+                "[bootstrap] Spread: yaw=%.1f° pitch=%.1f° roll=%.1f° (thresholds: %.0f/%.0f/%.0f)",
+                maxYawSpread, maxPitchSpread, maxRollSpread,
+                BOOTSTRAP_YAW_SPREAD_DEG, BOOTSTRAP_PITCH_SPREAD_DEG, BOOTSTRAP_ROLL_SPREAD_DEG));
+
+        // All samples agree — promote all
+        if (maxYawSpread <= BOOTSTRAP_YAW_SPREAD_DEG
+                && maxPitchSpread <= BOOTSTRAP_PITCH_SPREAD_DEG
+                && maxRollSpread <= BOOTSTRAP_ROLL_SPREAD_DEG) {
+            log(String.format(Locale.US,
+                    "[bootstrap] All %d samples agree — promoting all", n));
+            return new ArrayList<>(provisional);
+        }
+
+        // Try to find a bad seed: check if excluding one sample makes the rest agree
+        for (int exclude = 0; exclude < n; exclude++) {
+            double pairMaxYaw = 0, pairMaxPitch = 0, pairMaxRoll = 0;
+            List<Integer> remaining = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                if (i != exclude) remaining.add(i);
+            }
+            for (int a = 0; a < remaining.size(); a++) {
+                for (int b = a + 1; b < remaining.size(); b++) {
+                    int ia = remaining.get(a), ib = remaining.get(b);
+                    pairMaxYaw = Math.max(pairMaxYaw, Math.abs(angleDifference(yaws[ia], yaws[ib])));
+                    pairMaxPitch = Math.max(pairMaxPitch, Math.abs(pitches[ia] - pitches[ib]));
+                    pairMaxRoll = Math.max(pairMaxRoll, Math.abs(angleDifference(rolls[ia], rolls[ib])));
+                }
+            }
+
+            if (pairMaxYaw <= BOOTSTRAP_YAW_SPREAD_DEG
+                    && pairMaxPitch <= BOOTSTRAP_PITCH_SPREAD_DEG
+                    && pairMaxRoll <= BOOTSTRAP_ROLL_SPREAD_DEG) {
+                log(String.format(Locale.US,
+                        "[bootstrap] Bad seed at provisional[%d] (yaw=%.1f° pitch=%.1f° roll=%.1f°) — discarding, promoting %d remaining",
+                        exclude, yaws[exclude], pitches[exclude], rolls[exclude], remaining.size()));
+                List<QRMeasurement> promoted = new ArrayList<>();
+                for (int i : remaining) {
+                    promoted.add(provisional.get(i));
+                }
+                return promoted;
+            }
+        }
+
+        // No majority found — all samples disagree
+        log(String.format(Locale.US,
+                "[bootstrap] No majority agreement — all %d samples disagree", n));
+        return null;
     }
 
     private double circularWeightedMean(List<YawSample> samples) {
@@ -1490,84 +1573,32 @@ public class MainActivity extends AppCompatActivity {
             totalWeight += s.weight;
         }
 
-        if (totalWeight < 1e-6) return 0;
+        if (totalWeight < 1e-6)
+            return 0;
 
         double mean = Math.toDegrees(Math.atan2(
                 sumSin / totalWeight,
-                sumCos / totalWeight
-        ));
+                sumCos / totalWeight));
 
-        if (mean < 0) mean += 360.0;
+        if (mean < 0)
+            mean += 360.0;
         return mean;
     }
 
-    private double circularMeanDegrees(List<Double> samples) {
-        if (samples.isEmpty()) return 0.0;
-        double sumSin = 0.0, sumCos = 0.0;
-        for (double value : samples) {
-            double rad = Math.toRadians(value);
-            sumSin += Math.sin(rad);
-            sumCos += Math.cos(rad);
-        }
-        double mean = Math.toDegrees(Math.atan2(sumSin / samples.size(), sumCos / samples.size()));
-        if (mean < 0) mean += 360.0;
-        return mean;
-    }
 
-    private List<Double> filterCircularOutliers(List<Double> samples) {
-        if (samples.size() < 5) return new ArrayList<>(samples);
-
-        double center = circularMeanDegrees(samples);
-        List<Double> deviations = new ArrayList<>(samples.size());
-        for (double sample : samples) {
-            deviations.add(Math.abs(angleDifference(center, sample)));
-        }
-        Collections.sort(deviations);
-
-        double medianDeviation = deviations.get(deviations.size() / 2);
-        double threshold = Math.max(3.0, Math.min(20.0, medianDeviation * 3.0 + 2.0));
-
-        List<Double> filtered = new ArrayList<>(samples.size());
-        for (double sample : samples) {
-            if (Math.abs(angleDifference(center, sample)) <= threshold) {
-                filtered.add(sample);
-            }
-        }
-
-        int minimumKept = Math.max(8, samples.size() / 2);
-        if (filtered.size() < minimumKept) {
-            log(String.format(Locale.US,
-                    "Mag outlier filter kept only %d/%d samples; falling back to all samples",
-                    filtered.size(), samples.size()));
-            return new ArrayList<>(samples);
-        }
-        return filtered;
-    }
 
     private void commitReading(SamplingSession session, double inputYaw, double inputPitch, double inputRoll) {
-        if (session == null || session.payload == null) return;
+        if (session == null || session.payload == null)
+            return;
 
         String payload = session.payload;
         boolean isAbsoluteNorth = Boolean.TRUE.equals(session.absoluteNorth);
         OffsetMode currentOffsetMode = isAbsoluteNorth ? OffsetMode.ABSOLUTE : OffsetMode.RELATIVE;
 
-        double offsetUsed;
-        double finalNorthYaw;
+        double offsetUsed = 0.0;
+        double finalNorthYaw = inputYaw;
         double finalPitch = inputPitch;
         double finalRoll = normalizeDegrees(inputRoll);
-
-        if (isAbsoluteNorth) {
-            offsetUsed = 0.0;
-            finalNorthYaw = inputYaw;
-        } else {
-            offsetUsed = resolveActiveOffsetAnchor(session);
-            if (!Double.isNaN(offsetUsed)) {
-                finalNorthYaw = (inputYaw + offsetUsed) % 360.0;
-                if (finalNorthYaw < 0) finalNorthYaw += 360.0;
-            } else {
-                finalNorthYaw = inputYaw;
-            }
-        }
 
         log("COMMIT READING DEBUG:");
         log(" -> Session ID: " + session.id);
@@ -1581,8 +1612,6 @@ public class MainActivity extends AppCompatActivity {
         log(" -> FINAL ROLL: " + finalRoll + "°");
 
         activeSamplingSession = null;
-        lastMeasurementMethod = null;
-        samplingOffsetAnchor = Double.NaN;
 
         double yawRad = Math.toRadians(finalNorthYaw);
         double pitchRad = Math.toRadians(finalPitch);
@@ -1628,7 +1657,8 @@ public class MainActivity extends AppCompatActivity {
                 showStatus(String.format(Locale.US,
                         "✅ Registered & Saved!\nYaw = %.1f°  Pitch = %.1f°  Roll = %.1f°  |  id=%d",
                         finalYaw, finalPitchValue, finalRollValue, dbId));
-                updateInfoLabel(finalYaw, finalPitchValue, finalRollValue, displayOffset, reg, null, InfoSource.FRESH_REGISTER);
+                updateInfoLabel(finalYaw, finalPitchValue, finalRollValue, displayOffset, reg, null,
+                        InfoSource.FRESH_REGISTER);
             });
 
             log(String.format(Locale.US, "Registered → payload=%s…  yaw=%.1f°  pitch=%.1f°  roll=%.1f°  dbId=%d",
@@ -1643,7 +1673,8 @@ public class MainActivity extends AppCompatActivity {
             }
 
             if (!hasFullOrientation(record)) {
-                showStatus("⚠️ This QR was registered before pitch/roll tracking was added.\nPress REGISTER to save full orientation again.");
+                showStatus(
+                        "⚠️ This QR was registered before pitch/roll tracking was added.\nPress REGISTER to save full orientation again.");
                 setMode(ScanMode.REGISTER);
                 return;
             }
@@ -1656,7 +1687,8 @@ public class MainActivity extends AppCompatActivity {
                     && !Double.isNaN(offsetUsed)) {
                 double offsetDelta = Math.abs(angleDifference(storedOffset, offsetUsed));
                 boolean offsetDrifted = offsetDelta > 10.0;
-                log(String.format(Locale.US, "[VALIDATE] Offset check: regOffset=%.1f° currentOffset=%.1f° delta=%.1f° drifted=%b",
+                log(String.format(Locale.US,
+                        "[VALIDATE] Offset check: regOffset=%.1f° currentOffset=%.1f° delta=%.1f° drifted=%b",
                         storedOffset, offsetUsed, offsetDelta, offsetDrifted));
             } else {
                 log(String.format(Locale.US,
@@ -1671,7 +1703,7 @@ public class MainActivity extends AppCompatActivity {
             double pitchDelta = finalPitch - record.pitch;
             double rollDelta = angleDifference(record.roll, finalRoll);
 
-// Apply separate tolerances per axis
+            // Apply separate tolerances per axis
             boolean yawWithin = Math.abs(yawDelta) <= YAW_TOLERANCE;
             boolean pitchWithin = Math.abs(pitchDelta) <= PITCH_TOLERANCE;
             boolean rollWithin = Math.abs(rollDelta) <= ROLL_TOLERANCE;
@@ -1710,7 +1742,8 @@ public class MainActivity extends AppCompatActivity {
                         rollDelta, ROLL_TOLERANCE));
 
                 dbBadge.setText("📝 Validation logged to DB");
-                updateInfoLabel(finalYaw1, finalPitch1, finalRoll1, displayOffset, record, validationSummary, InfoSource.DATABASE);
+                updateInfoLabel(finalYaw1, finalPitch1, finalRoll1, displayOffset, record, validationSummary,
+                        InfoSource.DATABASE);
             });
 
             log(String.format(Locale.US,
@@ -1723,130 +1756,40 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Core: Compute QR World Yaw via ARCore (Wall + Floor)
-    // ─────────────────────────────────────────────────────────────────────────
-    private QRMeasurement computeQRYawFromTopEdgeWithPose(float[] imagePoints, float[] camPose,
-                                                          CameraIntrinsics intr, float[] fopAttitude) {
-        float[] focal = intr.getFocalLength();
-        float[] pp = intr.getPrincipalPoint();
-        float fx = focal[0], fy = focal[1], cx = pp[0], cy = pp[1];
 
-        // ML Kit quad corners (used for wall VP normal calculation)
-        float[][] imgPts = {
-                {imagePoints[0], imagePoints[1]},
-                {imagePoints[2], imagePoints[3]},
-                {imagePoints[4], imagePoints[5]},
-                {imagePoints[6], imagePoints[7]}
-        };
+    private double unifiedComputeNorthOffset(float[] camPose, float[] fopAttitude) {
+        if (fopAttitude == null)
+            return Double.NaN;
 
-        String method = "vanishing-point";
-        double yaw;
-        double confidence = 0.8;
+        float arFwdX = -camPose[8];
+        float arFwdZ = -camPose[10];
+        double arCamYaw = Math.toDegrees(Math.atan2(arFwdX, -arFwdZ));
+        if (arCamYaw < 0)
+            arCamYaw += 360.0;
 
-        // 1. Calculate Normal from Vanishing Points
-        VpEstimate vpEstimate = computeNormalViaVanishingPoint(
-                imgPts[0], imgPts[1], imgPts[2], imgPts[3], focal, pp, camPose);
-        float[] planeNormal = vpEstimate != null ? vpEstimate.normalWorld.clone() : null;
-        float[] vpNormalCam = vpEstimate != null ? vpEstimate.normalCam.clone() : null;
-
-        if (planeNormal == null) {
-            // VP failed — check if camera is looking down (floor QR viewed straight-on)
-            float camFwdY = -camPose[9];
-            if (camFwdY < -0.3f) {
-                log(String.format(Locale.US,
-                        "[yawCalc] VP null but camera looking down (camFwdY=%.3f) — assuming floor",
-                        camFwdY));
-                planeNormal = new float[]{0f, 1f, 0f};
-            } else {
-                log("[yawCalc] Vanishing-point solve failed — no normal available");
-                return null;
-            }
+        float[] rotMatrix = new float[9];
+        android.hardware.SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude);
+        float east = -rotMatrix[2];
+        float north = -rotMatrix[5];
+        double fopHeading;
+        if (Math.hypot(east, north) < 1e-5) {
+            return Double.NaN;
         }
+        fopHeading = Math.toDegrees(Math.atan2(east, north));
+        if (fopHeading < 0)
+            fopHeading += 360.0;
 
-        // 2. Ensure Normal is facing the camera
-        float[] camFwd = {-camPose[8], -camPose[9], -camPose[10]};
-        float dotNormalCamFwd = vec3Dot(planeNormal, camFwd);
-        if (dotNormalCamFwd < 0) {
-            planeNormal = vec3Scale(planeNormal, -1f);
-            if (vpNormalCam != null) {
-                vpNormalCam = vec3Scale(vpNormalCam, -1f);
-            }
-            log(String.format(Locale.US, "[yawCalc] Normal flipped (dot=%.3f) → now=(%.3f,%.3f,%.3f)",
-                    dotNormalCamFwd, planeNormal[0], planeNormal[1], planeNormal[2]));
-        }
+        double offset = angleDifference(arCamYaw, fopHeading);
+        return offset;
+    }
 
-        // 3. Pitch: surface tilt (Wall=0°, Floor=+90°, Ceiling=-90°)
-        double clampedY = Math.max(-1.0, Math.min(1.0, planeNormal[1]));
-        double pitch = Math.toDegrees(Math.asin(clampedY));
-
-        // 4. Yaw: Wall vs Floor split
-        double hx = planeNormal[0];
-        double hz = planeNormal[2];
-        double horizLen = Math.hypot(hx, hz);
-        double vpWallRawYaw = Double.NaN;
-        double vpWallNorthYaw = Double.NaN;
-
-        if (horizLen > 0.50) {
-            // ─── 🧱 WALL CASE ───
-            // Use the face normal projected onto horizontal plane.
-            // ML Kit corners are fine here — yaw comes from normal direction, not corner identity.
-            vpWallRawYaw = normalizeDegrees(Math.toDegrees(Math.atan2(hx, -hz)));
-            if (!Double.isNaN(samplingOffsetAnchor)) {
-                vpWallNorthYaw = normalizeDegrees(vpWallRawYaw + samplingOffsetAnchor);
-            }
-            QRMeasurement wallResult = computeWallYawWithSolvePnP(
-                    imagePoints,
-                    intr,
-                    camPose,
-                    fopAttitude,
-                    vpNormalCam,
-                    vpWallRawYaw,
-                    vpWallNorthYaw
-            );
-            if (wallResult != null) {
-                return wallResult;
-            }
-
-            QRMeasurement wallFallback = buildWallVpFallbackMeasurement(
-                    imagePoints,
-                    focal,
-                    pp,
-                    camPose,
-                    fopAttitude,
-                    planeNormal,
-                    vpNormalCam,
-                    pitch,
-                    vpWallRawYaw
-            );
-            if (wallFallback != null) {
-                return wallFallback;
-            }
-
-            log("[yawCalc] Wall QR detected, but solvePnP failed and no safe fallback was available. Dropping frame.");
-            return null;
-
-        } else {
-            // ─── 🪩 FLOOR CASE ───
-            // Use ZXing finder pattern centers directly.
-            // ZXing structurally identifies TL and BL from the QR's internal bit layout,
-            // so these are always the correct physical corners regardless of camera position.
-            // This is the Android equivalent of what iOS Vision does automatically.
-
-            QRMeasurement pnpResult = computeFloorYawWithSolvePnP(
-                    imagePoints,
-                    intr,
-                    camPose,
-                    fopAttitude
-            );
-            if (pnpResult != null) {
-                return pnpResult;
-            }
-
-            log("[yawCalc] Floor QR detected, but solvePnP failed. Dropping frame.");
-            return null;
-        }
-
+    private double angleDifference(double a, double b) {
+        double diff = b - a;
+        while (diff > 180)
+            diff -= 360;
+        while (diff < -180)
+            diff += 360;
+        return diff;
     }
 
     private VpEstimate computeNormalViaVanishingPoint(
@@ -1856,10 +1799,10 @@ public class MainActivity extends AppCompatActivity {
             float fx = focalLength[0], fy = focalLength[1];
             float cx = principalPt[0], cy = principalPt[1];
 
-            float[] hTL = {imgTL[0], imgTL[1], 1f};
-            float[] hTR = {imgTR[0], imgTR[1], 1f};
-            float[] hBR = {imgBR[0], imgBR[1], 1f};
-            float[] hBL = {imgBL[0], imgBL[1], 1f};
+            float[] hTL = { imgTL[0], imgTL[1], 1f };
+            float[] hTR = { imgTR[0], imgTR[1], 1f };
+            float[] hBR = { imgBR[0], imgBR[1], 1f };
+            float[] hBL = { imgBL[0], imgBL[1], 1f };
 
             float[] lineTop = vec3Cross(hTL, hTR);
             float[] lineBottom = vec3Cross(hBL, hBR);
@@ -1870,7 +1813,6 @@ public class MainActivity extends AppCompatActivity {
             float[] vpY = vec3Cross(lineLeft, lineRight);
 
             if (Math.abs(vpX[2]) < 1e-6f || Math.abs(vpY[2]) < 1e-6f) {
-                Log.d(TAG, "Vanishing points at infinity — QR is square-on, skipping VP solve");
                 return null;
             }
 
@@ -1878,23 +1820,16 @@ public class MainActivity extends AppCompatActivity {
             float[] rayY = toCameraRay(vpY, fx, fy, cx, cy);
 
             if (vec3Len(rayX) < 0.001f || vec3Len(rayY) < 0.001f) {
-                Log.d(TAG, "Degenerate VP rays");
                 return null;
             }
 
             float[] normalCam = vec3Normalize(vec3Cross(rayX, rayY));
-            if (normalCam[2] < 0) normalCam = vec3Scale(normalCam, -1f);
+            if (normalCam[2] < 0)
+                normalCam = vec3Scale(normalCam, -1f);
 
             float[] normalWorld = rotateCamToWorld(normalCam, camTransform);
-
-            Log.d(TAG, String.format(Locale.US,
-                    "VanishingPoint: normalCam=(%.3f,%.3f,%.3f) normalWorld=(%.3f,%.3f,%.3f)",
-                    normalCam[0], normalCam[1], normalCam[2],
-                    normalWorld[0], normalWorld[1], normalWorld[2]));
-
             return new VpEstimate(normalCam, normalWorld);
         } catch (Exception e) {
-            Log.e(TAG, "Vanishing point solve failed", e);
             return null;
         }
     }
@@ -1903,157 +1838,305 @@ public class MainActivity extends AppCompatActivity {
         float w = v[2];
         float x = (v[0] - w * cx) / fx;
         float y = (v[1] - w * cy) / fy;
-        return vec3Normalize(new float[]{x, -y, -w});
+        return vec3Normalize(new float[] { x, -y, -w });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Yaw Math & Corner Helpers
-    // ─────────────────────────────────────────────────────────────────────────
-    private double angleDifference(double a, double b) {
-        double diff = b - a;
-        while (diff > 180) diff -= 360;
-        while (diff < -180) diff += 360;
-        return diff;
-    }
-
-    private boolean isAbsoluteNorthMethod(String method) {
-        return method != null && method.endsWith("-direct");
-    }
-
-    private boolean isWallDirectMethod(String method) {
-        return method != null && method.startsWith("wall-") && method.endsWith("-direct");
-    }
-
-    private double confidenceFromReprojectionError(double reprojErrorPx) {
-        if (Double.isNaN(reprojErrorPx) || Double.isInfinite(reprojErrorPx) || reprojErrorPx < 0.0) {
-            return 0.0;
-        }
-
-        double normalizedError = reprojErrorPx / DIRECT_REPROJECTION_CONFIDENCE_SCALE_PX;
-        return 1.0 / (1.0 + normalizedError * normalizedError);
-    }
-
-    private double getWallContinuityReferenceYaw() {
-        if (sampleBuffer.isEmpty()) return Double.NaN;
-        if (!isWallDirectMethod(lastMeasurementMethod)) return Double.NaN;
-        return circularWeightedMeanNorth(sampleBuffer);
-    }
-
-    private QRMeasurement buildWallVpFallbackMeasurement(
-            float[] imagePoints,
-            float[] focalLength,
-            float[] principalPoint,
-            float[] camPose,
-            float[] fopAttitude,
-            float[] planeNormalWorld,
-            float[] planeNormalCam,
-            double pitch,
-            double vpWallRawYaw) {
-        if (planeNormalCam == null) {
-            log("[yawCalc] Wall VP fallback unavailable - camera-space plane normal missing");
+    private float[] unifiedGetARCoreNorth(float[] camPose, float[] fopAttitude) {
+        double offset = unifiedComputeNorthOffset(camPose, fopAttitude);
+        if (Double.isNaN(offset))
             return null;
-        }
 
-        float[] vpUpCam = computeWallVpUpVectorInCamera(
-                imagePoints,
-                focalLength,
-                principalPoint,
-                planeNormalCam
-        );
-        if (vpUpCam == null) {
-            log("[yawCalc] Wall VP fallback unavailable - could not derive VP up vector");
-            return null;
-        }
-
-        if (fopAttitude != null) {
-            log("[yawCalc] Wall solvePnP failed - skipping VP fallback because VP yaw is ARCore-relative, not FOP-aligned");
-            return null;
-        }
-
-        float[] vpUpWorld = rotateCamToWorld(vpUpCam, camPose);
-        double roll = computeWallRollDegrees(vpUpWorld, planeNormalWorld);
-        if (Double.isNaN(roll)) {
-            log("[yawCalc] Wall VP fallback unavailable - roll math returned NaN");
-            return null;
-        }
-
-        // Use the 180° aligned wall-normal math so the VP fallback matches the direct wall path.
-        double alignedVpYaw = normalizeDegrees(vpWallRawYaw + 180.0);
-        double finalYaw = alignedVpYaw;
-
-        // Legacy 2D offset mode still needs the sampled anchor baked in here.
-        if (fopAttitude == null && !Double.isNaN(samplingOffsetAnchor)) {
-            finalYaw = normalizeDegrees(alignedVpYaw + samplingOffsetAnchor);
-        }
-
-        log(String.format(Locale.US,
-                "[yawCalc] Wall solvePnP failed - using VP fallback yaw=%.1f deg pitch=%.1f deg roll=%.1f deg rawVp=%.1f deg alignedVp=%.1f deg mode=%s",
-                finalYaw,
-                pitch,
-                roll,
-                vpWallRawYaw,
-                alignedVpYaw,
-                "legacy-offset"));
-        return new QRMeasurement(finalYaw, pitch, roll, 0.8, "wall-vp", true);
+        double northArYawRad = Math.toRadians(-offset);
+        return new float[] {
+                (float) Math.sin(northArYawRad),
+                0f,
+                (float) -Math.cos(northArYawRad)
+        };
     }
 
-    private float[] computeWallVpUpVectorInCamera(
-            float[] imagePoints,
-            float[] focalLength,
-            float[] principalPoint,
-            float[] planeNormalCam) {
-        float fx = focalLength[0];
-        float fy = focalLength[1];
-        float cx = principalPoint[0];
-        float cy = principalPoint[1];
-
-        float centerX = (imagePoints[0] + imagePoints[2] + imagePoints[4] + imagePoints[6]) * 0.25f;
-        float centerY = (imagePoints[1] + imagePoints[3] + imagePoints[5] + imagePoints[7]) * 0.25f;
-        float topMidX = (imagePoints[0] + imagePoints[2]) * 0.5f;
-        float topMidY = (imagePoints[1] + imagePoints[3]) * 0.5f;
-
-        float[] normalCam = vec3Normalize(planeNormalCam);
-        float[] centerRay = toCameraRay(new float[]{centerX, centerY, 1f}, fx, fy, cx, cy);
-        float[] topMidRay = toCameraRay(new float[]{topMidX, topMidY, 1f}, fx, fy, cx, cy);
-
-        float centerDenom = vec3Dot(centerRay, normalCam);
-        float topDenom = vec3Dot(topMidRay, normalCam);
-        if (Math.abs(centerDenom) < 1e-6f || Math.abs(topDenom) < 1e-6f) {
+    private static float[] unifiedIntersectRayPlane(float[] rayOrigin, float[] rayDir,
+                                                    float[] planePoint, float[] planeNormal) {
+        float denom = vec3Dot(rayDir, planeNormal);
+        if (Math.abs(denom) < 1e-5f)
             return null;
+
+        float[] diff = {
+                planePoint[0] - rayOrigin[0],
+                planePoint[1] - rayOrigin[1],
+                planePoint[2] - rayOrigin[2]
+        };
+        float t = vec3Dot(diff, planeNormal) / denom;
+        if (t <= 0)
+            return null;
+
+        return new float[] {
+                rayOrigin[0] + rayDir[0] * t,
+                rayOrigin[1] + rayDir[1] * t,
+                rayOrigin[2] + rayDir[2] * t
+        };
+    }
+
+    private static float[] unifiedProjectOntoPlane(float[] v, float[] planeNormal) {
+        float d = vec3Dot(v, planeNormal);
+        return new float[] {
+                v[0] - planeNormal[0] * d,
+                v[1] - planeNormal[1] * d,
+                v[2] - planeNormal[2] * d
+        };
+    }
+
+    private static float[] unifiedBuildWorldRay(float imgX, float imgY,
+                                                float fx, float fy, float cx, float cy,
+                                                float[] camPose) {
+        float xn = (imgX - cx) / fx;
+        float yn = -(imgY - cy) / fy;
+        float[] camDir = vec3Normalize(new float[] { xn, yn, -1.0f });
+        return vec3Normalize(rotateCamToWorld(camDir, camPose));
+    }
+
+    private QRMeasurement calculateUnifiedQRMeasurement(float[] imagePoints,
+                                                        float[] camPose,
+                                                        com.google.ar.core.CameraIntrinsics intrinsics,
+                                                        float[] fopAttitude) {
+        final String P = "[unified]";
+
+        float[] focal = intrinsics.getFocalLength();
+        float[] pp = intrinsics.getPrincipalPoint();
+        float fx = focal[0], fy = focal[1], cx = pp[0], cy = pp[1];
+
+        float[] camOrigin = { camPose[12], camPose[13], camPose[14] };
+        float[] camFwd = { -camPose[8], -camPose[9], -camPose[10] };
+
+        float[][] rays = new float[4][];
+        for (int i = 0; i < 4; i++) {
+            rays[i] = unifiedBuildWorldRay(imagePoints[i * 2], imagePoints[i * 2 + 1], fx, fy, cx, cy, camPose);
         }
 
-        // Plane scale is arbitrary here; n·X = 1 is enough to recover an in-plane direction.
-        float[] centerPoint = vec3Scale(centerRay, 1f / centerDenom);
-        float[] topPoint = vec3Scale(topMidRay, 1f / topDenom);
-        float[] upCam = new float[]{
-                topPoint[0] - centerPoint[0],
-                topPoint[1] - centerPoint[1],
-                topPoint[2] - centerPoint[2]
+        float[][] imgPts = {
+                { imagePoints[0], imagePoints[1] }, { imagePoints[2], imagePoints[3] },
+                { imagePoints[4], imagePoints[5] }, { imagePoints[6], imagePoints[7] }
         };
 
-        float normalComponent = vec3Dot(upCam, normalCam);
-        upCam = new float[]{
-                upCam[0] - normalCam[0] * normalComponent,
-                upCam[1] - normalCam[1] * normalComponent,
-                upCam[2] - normalCam[2] * normalComponent
-        };
+        VpEstimate vpEstimate = computeNormalViaVanishingPoint(
+                imgPts[0], imgPts[1], imgPts[2], imgPts[3], focal, pp, camPose);
 
-        if (vec3Len(upCam) < 1e-5f) {
-            return null;
+        float[] planeNormal;
+        String planeSource;
+
+        if (vpEstimate != null) {
+            planeNormal = vpEstimate.normalWorld.clone();
+            planeSource = "VP";
+        } else {
+            float camFwdY = camFwd[1];
+            if (camFwdY < -0.3f) {
+                planeNormal = new float[] { 0f, 1f, 0f };
+                planeSource = "assumed-floor";
+            } else {
+                Log.d(TAG, String.format(Locale.US, "%s ABORT: VP failed, camFwdY=%.3f", P, camFwdY));
+                return null;
+            }
         }
-        return vec3Normalize(upCam);
+
+        float dotNF = vec3Dot(planeNormal, camFwd);
+        if (dotNF < 0) {
+            planeNormal = vec3Scale(planeNormal, -1f);
+        }
+
+        double hx = planeNormal[0];
+        double hz = planeNormal[2];
+        double horizLen = Math.hypot(hx, hz);
+
+        String surfaceClass;
+        if (horizLen > 0.70)
+            surfaceClass = "WALL";
+        else if (horizLen < UNIFIED_WALL_FLOOR_THRESHOLD)
+            surfaceClass = "FLOOR";
+        else
+            surfaceClass = "TILTED";
+
+        if (surfaceClass.equals("FLOOR")) {
+            // Lock floor normal perfectly to gravity (DOWN) to prevent oblique
+            // dotNF hemisphere flips which reverse the roll basis (East/West).
+            // This guarantees an immutable, perfect horizontal projection plane for corners.
+            planeNormal = new float[]{0f, -1f, 0f};
+        }
+
+        double clampedY = Math.max(-1.0, Math.min(1.0, planeNormal[1]));
+        double pitch = Math.toDegrees(Math.asin(clampedY));
+
+        float[] planePt = { camOrigin[0] + camFwd[0], camOrigin[1] + camFwd[1], camOrigin[2] + camFwd[2] };
+        float[][] corners3D = new float[4][];
+        for (int i = 0; i < 4; i++) {
+            corners3D[i] = unifiedIntersectRayPlane(camOrigin, rays[i], planePt, planeNormal);
+            if (corners3D[i] == null)
+                return null;
+        }
+
+        double arYaw;
+        String yawSource;
+        if (horizLen > UNIFIED_WALL_FLOOR_THRESHOLD) {
+            // Negate horizontal components to use the OUTWARD-facing normal
+            // (away from wall, toward camera) for yaw. The dotNF flip above
+            // resolves the VP normal to point INTO the wall (aligned with
+            // camFwd); iOS uses the outward normal, so we negate hx/hz here
+            // for yaw only — pitch and roll still use planeNormal as-is.
+            arYaw = Math.toDegrees(Math.atan2(-hx / horizLen, hz / horizLen));
+            if (arYaw < 0)
+                arYaw += 360.0;
+            yawSource = "face-normal";
+        } else {
+            // ── Floor: yaw from the QR's intrinsic "up" direction ──────────────
+            // The QR detector identifies finder patterns and returns corners in a
+            // QR-intrinsic order (TL/TR/BR/BL relative to the printed code).
+            // corners3D[0]-corners3D[3] = TL-BL = left edge = QR "up" direction.
+            // We MUST extract this BEFORE canonicalizeFloorCorners(), which
+            // reorders corners by world azimuth and erases QR orientation.
+            float[] qrUp = { corners3D[0][0] - corners3D[3][0],
+                             corners3D[0][1] - corners3D[3][1],
+                             corners3D[0][2] - corners3D[3][2] };
+            double ux = qrUp[0], uz = qrUp[2];
+            double uLen = Math.hypot(ux, uz);
+            if (uLen < 0.01)
+                return null;
+            arYaw = Math.toDegrees(Math.atan2(ux / uLen, -uz / uLen));
+            if (arYaw < 0)
+                arYaw += 360.0;
+            yawSource = "qr-up-vector";
+
+            // Canonicalize corners for stable ROLL computation only.
+            // topEdge3D and qrUp3D (used for roll at lines 2034-2039) still
+            // benefit from north-anchored ordering to prevent roll jumps.
+            float[] arNorthForCanon = unifiedGetARCoreNorth(camPose, fopAttitude);
+            if (arNorthForCanon != null) {
+                corners3D = canonicalizeFloorCorners(corners3D, arNorthForCanon);
+            }
+        }
+
+        double northOffset = unifiedComputeNorthOffset(camPose, fopAttitude);
+        double compassYaw = (arYaw + (Double.isNaN(northOffset) ? 0 : northOffset)) % 360.0;
+        if (compassYaw < 0)
+            compassYaw += 360.0;
+
+        float[] worldUp = { 0f, 1f, 0f };
+        float[] refCandidate = unifiedProjectOntoPlane(worldUp, planeNormal);
+        float refLen = vec3Len(refCandidate);
+        String rollRefUsed = "world-up";
+
+        if (refLen < 0.15f) {
+            float[] arNorth = unifiedGetARCoreNorth(camPose, fopAttitude);
+            if (arNorth != null) {
+                refCandidate = unifiedProjectOntoPlane(arNorth, planeNormal);
+                refLen = vec3Len(refCandidate);
+                rollRefUsed = (refLen >= 0.01) ? "world-north" : "arcore-minus-z-fallback";
+            }
+            if (refLen < 0.01f) {
+                refCandidate = unifiedProjectOntoPlane(new float[] { 0f, 0f, -1f }, planeNormal);
+                refLen = vec3Len(refCandidate);
+                rollRefUsed = "arcore-minus-z-fallback";
+            }
+        }
+
+        if (refLen < 0.01f)
+            return null;
+
+        float[] topEdge3D = vec3Normalize(new float[] { corners3D[1][0] - corners3D[0][0],
+                corners3D[1][1] - corners3D[0][1], corners3D[1][2] - corners3D[0][2] });
+        float[] qrUp3D = vec3Normalize(new float[] { corners3D[0][0] - corners3D[3][0], corners3D[0][1] - corners3D[3][1],
+                corners3D[0][2] - corners3D[3][2] });
+
+        double rollTopEdge = computeInPlaneAngle(topEdge3D, refCandidate, planeNormal);
+
+        // ── Floor-only diagnostic logging ──────────────────────────────────────────
+        if (VERBOSE_FRAME_LOGS && surfaceClass.equals("FLOOR")) {
+            Log.d(TAG, String.format(Locale.US,
+                    "[floor-diag] planeNormal=(%.3f,%.3f,%.3f) rollRef=(%.3f,%.3f,%.3f) rollRefUsed=%s",
+                    planeNormal[0], planeNormal[1], planeNormal[2],
+                    refCandidate[0], refCandidate[1], refCandidate[2], rollRefUsed));
+            Log.d(TAG, String.format(Locale.US,
+                    "[floor-diag] qrUp3D=(%.3f,%.3f,%.3f) topEdge3D=(%.3f,%.3f,%.3f)",
+                    qrUp3D[0], qrUp3D[1], qrUp3D[2], topEdge3D[0], topEdge3D[1], topEdge3D[2]));
+            Log.d(TAG, String.format(Locale.US,
+                    "[floor-diag] arYaw=%.2f northOffset=%.2f compassYaw=%.2f roll=%.2f yawSrc=%s",
+                    arYaw, northOffset, compassYaw, rollTopEdge, yawSource));
+        }
+
+        double baseConf = planeSource.equals("VP") ? 0.70 : 0.40;
+        double vertConf = horizLen > UNIFIED_WALL_FLOOR_THRESHOLD ? Math.min(horizLen, 1.0) : 1.0;
+        double confidence = baseConf * vertConf;
+
+        if (VERBOSE_FRAME_LOGS) {
+            Log.i(TAG, String.format(Locale.US,
+                    "%s [CANONICAL] yaw=%.1f° pitch=%.1f° roll=%.1f° conf=%.2f",
+                    P, compassYaw, pitch, rollTopEdge, confidence));
+        }
+
+        return new QRMeasurement(compassYaw, pitch, rollTopEdge, confidence, "unified-" + surfaceClass.toLowerCase(),
+                true);
     }
+
+    /**
+     * Reorders 4 floor corners (already in world space on a gravity-locked plane) into a
+     * canonical CCW ordering when viewed from above, anchored so that corners3D[0] is always
+     * the corner whose world azimuth from the centroid is closest to true north.
+     * This eliminates the view-heading-dependent corner-label assignment that causes
+     * yaw and roll to shift together between sessions from different camera headings.
+     */
+    private static float[][] canonicalizeFloorCorners(float[][] corners3D, float[] arNorth) {
+        // Centroid in XZ
+        float cx = 0, cz = 0;
+        for (float[] c : corners3D) { cx += c[0]; cz += c[2]; }
+        cx /= 4; cz /= 4;
+
+        // Azimuth of each corner from centroid, measured CCW from arNorth in the horizontal plane
+        double[] azimuths = new double[4];
+        for (int i = 0; i < 4; i++) {
+            double dx = corners3D[i][0] - cx;
+            double dz = corners3D[i][2] - cz;
+            // Angle of corner relative to arNorth direction (CCW positive)
+            // arNorth = (nx, 0, nz); perpendicular CCW = (-nz, 0, nx)
+            double along  = arNorth[0] * dx + arNorth[2] * dz;  // component along north
+            double perp   = -arNorth[2] * dx + arNorth[0] * dz; // component CCW-perp to north
+            azimuths[i] = Math.toDegrees(Math.atan2(perp, along));
+            if (azimuths[i] < 0) azimuths[i] += 360.0;
+        }
+
+        // Sort corners by azimuth CCW (starting from northernmost)
+        Integer[] idx = {0, 1, 2, 3};
+        java.util.Arrays.sort(idx, (a, b) -> Double.compare(azimuths[a], azimuths[b]));
+
+        float[][] sorted = new float[4][];
+        for (int i = 0; i < 4; i++) sorted[i] = corners3D[idx[i]];
+        return sorted;
+    }
+
+
+    private static double computeInPlaneAngle(float[] directionWorld,
+                                              float[] refProjected,
+                                              float[] planeNormal) {
+        float[] refDir = vec3Normalize(refProjected);
+        float[] refPerp = vec3Normalize(vec3Cross(planeNormal, refDir));
+        if (vec3Len(refDir) < 1e-4f || vec3Len(refPerp) < 1e-4f) {
+            return Double.NaN;
+        }
+        double cosA = vec3Dot(directionWorld, refDir);
+        double sinA = vec3Dot(directionWorld, refPerp);
+        double angle = Math.toDegrees(Math.atan2(sinA, cosA));
+        if (angle < 0)
+            angle += 360.0;
+        return angle;
+    }
+
 
     private List<float[]> toCornerList(float[] points) {
         List<float[]> corners = new ArrayList<>(4);
         for (int i = 0; i < 4; i++) {
-            corners.add(new float[]{points[i * 2], points[i * 2 + 1]});
+            corners.add(new float[] { points[i * 2], points[i * 2 + 1] });
         }
         return corners;
     }
 
     private float[] captureImageToViewBasis(Frame frame, int imageWidth, int imageHeight) {
-        float[] srcBasis = new float[]{
+        float[] srcBasis = new float[] {
                 0f, 0f,
                 (float) imageWidth, 0f,
                 0f, (float) imageHeight
@@ -2062,8 +2145,7 @@ public class MainActivity extends AppCompatActivity {
         try {
             frame.transformCoordinates2d(
                     com.google.ar.core.Coordinates2d.IMAGE_PIXELS, srcBasis,
-                    com.google.ar.core.Coordinates2d.VIEW, dstBasis
-            );
+                    com.google.ar.core.Coordinates2d.VIEW, dstBasis);
             return dstBasis;
         } catch (Exception e) {
             Log.w(TAG, "captureImageToViewBasis failed", e);
@@ -2072,7 +2154,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private float[] mapImagePointsToView(float[] imagePoints, float[] viewBasis, int imageWidth, int imageHeight) {
-        if (viewBasis == null || imagePoints == null || imagePoints.length != 8 || imageWidth <= 0 || imageHeight <= 0) {
+        if (viewBasis == null || imagePoints == null || imagePoints.length != 8 || imageWidth <= 0
+                || imageHeight <= 0) {
             return null;
         }
 
@@ -2109,8 +2192,7 @@ public class MainActivity extends AppCompatActivity {
                 new Point(imagePoints[0], imagePoints[1]),
                 new Point(imagePoints[2], imagePoints[3]),
                 new Point(imagePoints[4], imagePoints[5]),
-                new Point(imagePoints[6], imagePoints[7])
-        );
+                new Point(imagePoints[6], imagePoints[7]));
 
         try {
             Imgproc.cornerSubPix(
@@ -2121,8 +2203,7 @@ public class MainActivity extends AppCompatActivity {
                     new TermCriteria(
                             TermCriteria.MAX_ITER + TermCriteria.EPS,
                             SUBPIX_MAX_ITER,
-                            SUBPIX_EPSILON)
-            );
+                            SUBPIX_EPSILON));
 
             Point[] refined = corners.toArray();
             float[] refinedPoints = new float[imagePoints.length];
@@ -2158,10 +2239,166 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // QR Frame Quality
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Computes geometry quality metrics from detector and refined QR corners.
+     * Always logs diagnostics. Corner layout: [TL_x, TL_y, TR_x, TR_y, BR_x, BR_y, BL_x, BL_y].
+     */
+    private QRFrameQuality evaluateQRFrameQuality(float[] detectorPoints, float[] refinedPoints) {
+        float tlX = refinedPoints[0], tlY = refinedPoints[1];
+        float trX = refinedPoints[2], trY = refinedPoints[3];
+        float brX = refinedPoints[4], brY = refinedPoints[5];
+        float blX = refinedPoints[6], blY = refinedPoints[7];
+
+        double top    = Math.hypot(trX - tlX, trY - tlY);
+        double right  = Math.hypot(brX - trX, brY - trY);
+        double bottom = Math.hypot(blX - brX, blY - brY);
+        double left   = Math.hypot(tlX - blX, tlY - blY);
+        double minEdge = Math.min(Math.min(top, bottom), Math.min(left, right));
+
+        double maxTB = Math.max(top, bottom);
+        double maxLR = Math.max(left, right);
+        double ratioTB = maxTB > 0 ? Math.min(top, bottom) / maxTB : 0;
+        double ratioLR = maxLR > 0 ? Math.min(left, right) / maxLR : 0;
+
+        // Shoelace area
+        double area = 0.5 * Math.abs(
+                tlX * trY - trX * tlY
+              + trX * brY - brX * trY
+              + brX * blY - blX * brY
+              + blX * tlY - tlX * blY);
+
+        // Convexity: all consecutive-edge cross products must share the same sign
+        float[][] corners = {{tlX, tlY}, {trX, trY}, {brX, brY}, {blX, blY}};
+        boolean convex = true;
+        int sign = 0;
+        for (int i = 0; i < 4; i++) {
+            float[] a = corners[i];
+            float[] b = corners[(i + 1) % 4];
+            float[] c = corners[(i + 2) % 4];
+            float cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+            int s = cross > 0 ? 1 : (cross < 0 ? -1 : 0);
+            if (s != 0) {
+                if (sign == 0) sign = s;
+                else if (s != sign) { convex = false; break; }
+            }
+        }
+
+        // Subpixel shift (detector → refined)
+        double totalShift = 0, maxShift = 0;
+        for (int i = 0; i < 8; i += 2) {
+            double dx = refinedPoints[i] - detectorPoints[i];
+            double dy = refinedPoints[i + 1] - detectorPoints[i + 1];
+            double shift = Math.hypot(dx, dy);
+            totalShift += shift;
+            maxShift = Math.max(maxShift, shift);
+        }
+        double avgShift = totalShift / 4.0;
+
+        QRFrameQuality q = new QRFrameQuality(top, bottom, left, right, minEdge,
+                ratioTB, ratioLR, area, avgShift, maxShift, convex);
+
+        if (VERBOSE_FRAME_LOGS) {
+            Log.d(TAG, String.format(Locale.US,
+                    "[qr-quality] area=%.0f top=%.1f bot=%.1f left=%.1f right=%.1f ratioTB=%.2f ratioLR=%.2f avgShift=%.2f maxShift=%.2f convex=%b",
+                    q.area, q.topEdge, q.bottomEdge, q.leftEdge, q.rightEdge,
+                    q.ratioTB, q.ratioLR, q.avgShift, q.maxShift, q.convex));
+        }
+
+        return q;
+    }
+
+    /**
+     * Returns true if the frame's QR geometry is good enough for sampling.
+     * Logs the specific rejection reason when returning false.
+     */
+    private boolean isFrameAcceptableForSampling(QRFrameQuality q) {
+        if (!q.convex) {
+            log("[qr-quality] REJECTED frame for sampling: reason=non-convex quad");
+            return false;
+        }
+        if (q.minEdge < QR_MIN_EDGE_PX) {
+            log(String.format(Locale.US,
+                    "[qr-quality] REJECTED frame for sampling: reason=minEdge %.1fpx < %.0fpx",
+                    q.minEdge, QR_MIN_EDGE_PX));
+            return false;
+        }
+        if (q.area < QR_MIN_AREA_PX2) {
+            log(String.format(Locale.US,
+                    "[qr-quality] REJECTED frame for sampling: reason=area %.0f < %.0f",
+                    q.area, QR_MIN_AREA_PX2));
+            return false;
+        }
+        if (q.ratioTB < QR_MIN_EDGE_RATIO) {
+            log(String.format(Locale.US,
+                    "[qr-quality] REJECTED frame for sampling: reason=ratioTB %.2f < %.2f",
+                    q.ratioTB, QR_MIN_EDGE_RATIO));
+            return false;
+        }
+        if (q.ratioLR < QR_MIN_EDGE_RATIO) {
+            log(String.format(Locale.US,
+                    "[qr-quality] REJECTED frame for sampling: reason=ratioLR %.2f < %.2f",
+                    q.ratioLR, QR_MIN_EDGE_RATIO));
+            return false;
+        }
+        if (q.maxShift > QR_MAX_SUBPIX_SHIFT_PX) {
+            log(String.format(Locale.US,
+                    "[qr-quality] REJECTED frame for sampling: reason=maxShift %.2fpx > %.1fpx",
+                    q.maxShift, QR_MAX_SUBPIX_SHIFT_PX));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns true if the current canonical yaw is consistent with the recent rolling history.
+     * Rejects single-frame yaw spikes that exceed the threshold from the recent circular mean.
+     * Always passes if the history buffer has fewer than 2 entries (not enough context).
+     */
+    private boolean isCanonicalYawContinuous(double currentYaw) {
+        if (Double.isNaN(currentYaw)) {
+            return true; // no measurement — let other gates handle it
+        }
+        if (recentCanonicalYaws.size() < 2) {
+            return true; // not enough history to judge
+        }
+
+        // Circular mean of recent canonical yaws (excluding the one we just added)
+        double sumSin = 0, sumCos = 0;
+        int count = 0;
+        for (Double yaw : recentCanonicalYaws) {
+            // Skip the last entry — it's the current frame we just pushed
+            if (count >= recentCanonicalYaws.size() - 1) break;
+            double rad = Math.toRadians(yaw);
+            sumSin += Math.sin(rad);
+            sumCos += Math.cos(rad);
+            count++;
+        }
+        if (count == 0) return true;
+
+        double recentMean = Math.toDegrees(Math.atan2(sumSin / count, sumCos / count));
+        if (recentMean < 0) recentMean += 360.0;
+
+        double diff = Math.abs(angleDifference(recentMean, currentYaw));
+
+        if (diff > CANONICAL_YAW_SPIKE_THRESHOLD_DEG) {
+            log(String.format(Locale.US,
+                    "[canonical-gate] REJECTED frame for sampling: recentMean=%.1f° current=%.1f° diff=%.1f° > threshold=%.0f°",
+                    recentMean, currentYaw, diff, CANONICAL_YAW_SPIKE_THRESHOLD_DEG));
+            return false;
+        }
+
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Continuous QR Detection via ML Kit + ZXing
     // ─────────────────────────────────────────────────────────────────────────
     private void processARFrame(Frame frame) {
-        if (!isProcessingFrame.compareAndSet(false, true)) return;
+        if (!isProcessingFrame.compareAndSet(false, true))
+            return;
         scanQrFromArFrame(frame);
     }
 
@@ -2219,7 +2456,8 @@ public class MainActivity extends AppCompatActivity {
                             runOnUiThread(() -> {
                                 overlayView.setCorners(null);
                                 lastDetectedCorners = null;
-                                if (lastPayload == null) showStatus("Scan a QR code to begin");
+                                if (lastPayload == null)
+                                    showStatus("Scan a QR code to begin");
                                 if (isSampling) {
                                     abortActiveSampling("⚠️ QR lost during sampling. Try again.");
                                 }
@@ -2239,28 +2477,71 @@ public class MainActivity extends AppCompatActivity {
                     cornersMat.get(0, 0, cornerData);
 
                     // [0,1]=TL | [2,3]=TR | [4,5]=BR | [6,7]=BL
-                    float[] detectorImagePoints = new float[]{
+                    float[] detectorImagePoints = new float[] {
                             cornerData[0], cornerData[1],
                             cornerData[2], cornerData[3],
                             cornerData[4], cornerData[5],
                             cornerData[6], cornerData[7]
                     };
                     final float[] imagePoints = refineCornersSubPixel(grayMat, detectorImagePoints);
+                    final QRFrameQuality frameQuality = evaluateQRFrameQuality(detectorImagePoints, imagePoints);
 
                     float[] viewPoints = mapImagePointsToView(imagePoints, capturedImageToViewBasis, width, height);
                     List<float[]> cornersList = viewPoints != null ? toCornerList(viewPoints) : null;
 
-                    final ResolvedFopAttitude resolvedFop = isSampling && !isCollectingMag
-                            ? resolveFopAttitudeForFrame(capturedImageTimestampNs, capturedAcquireElapsedRealtimeNs)
+                    // ── Always resolve FOP for unified diagnostic (even when not sampling) ──
+                    final ResolvedFopAttitude resolvedFopForDiag = resolveFopAttitudeForFrame(capturedImageTimestampNs,
+                            capturedAcquireElapsedRealtimeNs);
+
+                    // ── Unified Attitude Resolve ──
+                    final ResolvedFopAttitude resolvedFop = isSampling
+                            ? resolvedFopForDiag
                             : null;
+
+                    // ── Unified Production Orientation Pipeline ──
+                    double diagCanonicalYaw = Double.NaN;
+                    {
+                        float[] uFop = null;
+                        if (resolvedFopForDiag != null) {
+                            uFop = resolvedFopForDiag.attitude;
+                        } else {
+                            TimedAttitude latest = lastFopSample;
+                            if (latest != null)
+                                uFop = latest.attitude;
+                        }
+                        try {
+                            QRMeasurement diagResult = calculateUnifiedQRMeasurement(
+                                    imagePoints,
+                                    capturedPose,
+                                    capturedIntrinsics,
+                                    uFop);
+                            if (diagResult != null) {
+                                diagCanonicalYaw = diagResult.yaw;
+                            }
+                        } catch (Exception e) {
+                            Log.e("QRYaws", "Unified production pipeline error", e);
+                        }
+                    }
+                    final double frameCanonicalYaw = diagCanonicalYaw;
 
                     runOnUiThread(() -> {
                         lastDetectedCorners = cornersList;
                         overlayView.setCorners(cornersList);
                         onQRPayloadDetected(payload);
 
-                        if (isSampling && !isCollectingMag) {
-                            collectSampleWithPose(imagePoints, capturedPose, capturedIntrinsics, resolvedFop, payload);
+                        // Feed canonical yaw into rolling buffer (every frame, not just sampling)
+                        if (!Double.isNaN(frameCanonicalYaw)) {
+                            recentCanonicalYaws.addLast(frameCanonicalYaw);
+                            while (recentCanonicalYaws.size() > CANONICAL_YAW_HISTORY_SIZE) {
+                                recentCanonicalYaws.removeFirst();
+                            }
+                        }
+
+                        if (isSampling) {
+                            if (isFrameAcceptableForSampling(frameQuality)
+                                    && isCanonicalYawContinuous(frameCanonicalYaw)) {
+                                collectSampleWithPose(imagePoints, capturedPose, capturedIntrinsics, resolvedFop, payload);
+                            }
                         }
                     });
 
@@ -2268,8 +2549,10 @@ public class MainActivity extends AppCompatActivity {
                     // If anything inside the thread crashes, log it here!
                     Log.e(TAG, "FATAL ERROR inside QR Executor thread!", e);
                 } finally {
-                    if (grayMat != null) grayMat.release();
-                    for (org.opencv.core.Mat m : points) m.release();
+                    if (grayMat != null)
+                        grayMat.release();
+                    for (org.opencv.core.Mat m : points)
+                        m.release();
                     // 🚨 GUARANTEES THE APP NEVER DEADLOCKS 🚨
                     isProcessingFrame.set(false);
                 }
@@ -2344,9 +2627,11 @@ public class MainActivity extends AppCompatActivity {
         if (validation != null) {
             lines.add("──────────────────────────");
             lines.add(String.format(Locale.US, "Δ Yaw   : %+.1f°  (tol ±%.0f°)", validation.yawDelta, YAW_TOLERANCE));
-            lines.add(String.format(Locale.US, "Δ Pitch : %+.1f°  (tol ±%.0f°)", validation.pitchDelta, PITCH_TOLERANCE));
+            lines.add(
+                    String.format(Locale.US, "Δ Pitch : %+.1f°  (tol ±%.0f°)", validation.pitchDelta, PITCH_TOLERANCE));
             lines.add(String.format(Locale.US, "Δ Roll  : %+.1f°  (tol ±%.0f°)", validation.rollDelta, ROLL_TOLERANCE));
-            lines.add("Result  : " + (validation.withinTolerance ? "✅ SAME POSITION + ORIENTATION" : "❌ MOVED OR ROTATED"));
+            lines.add("Result  : "
+                    + (validation.withinTolerance ? "✅ SAME POSITION + ORIENTATION" : "❌ MOVED OR ROTATED"));
         }
 
         String text = String.join("\n", lines);
@@ -2363,9 +2648,12 @@ public class MainActivity extends AppCompatActivity {
 
     private String relativeTime(Date date) {
         long diff = System.currentTimeMillis() - date.getTime();
-        if (diff < 60_000) return "just now";
-        if (diff < 3_600_000) return (diff / 60_000) + "m ago";
-        if (diff < 86_400_000) return (diff / 3_600_000) + "h ago";
+        if (diff < 60_000)
+            return "just now";
+        if (diff < 3_600_000)
+            return (diff / 60_000) + "m ago";
+        if (diff < 86_400_000)
+            return (diff / 3_600_000) + "h ago";
         return (diff / 86_400_000) + "d ago";
     }
 
@@ -2382,34 +2670,15 @@ public class MainActivity extends AppCompatActivity {
         frame.getCamera().getPose().toMatrix(m, 0);
         float fx = -m[8], fz = -m[10];
         double yaw = Math.toDegrees(Math.atan2(fx, -fz));
-        if (yaw < 0) yaw += 360;
+        if (yaw < 0)
+            yaw += 360;
         return yaw;
-    }
-
-    private double getCameraHeadingDegrees(DeviceOrientation orientation) {
-        float[] attitude = orientation.getAttitude();
-        if (attitude.length < 4) {
-            return orientation.getHeadingDegrees();
-        }
-
-        float[] rotationMatrix = new float[9];
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, attitude);
-
-        float east = -rotationMatrix[2];
-        float north = -rotationMatrix[5];
-
-        if (Math.hypot(east, north) < 1e-5) {
-            return orientation.getHeadingDegrees();
-        }
-
-        double heading = Math.toDegrees(Math.atan2(east, north));
-        if (heading < 0) heading += 360.0;
-        return heading;
     }
 
     private double normalizeDegrees(double angle) {
         angle %= 360.0;
-        if (angle < 0) angle += 360.0;
+        if (angle < 0)
+            angle += 360.0;
         return angle;
     }
 
@@ -2431,611 +2700,6 @@ public class MainActivity extends AppCompatActivity {
                 : String.format(Locale.US, "%-9s: %.1f°", label, angle);
     }
 
-    private double computeWallRollDegrees(float[] upWorld, float[] normalWorld) {
-        float[] referenceUp = new float[]{
-                -normalWorld[0] * normalWorld[1],
-                1f - normalWorld[1] * normalWorld[1],
-                -normalWorld[2] * normalWorld[1]
-        };
-        if (vec3Len(referenceUp) < 1e-4f) {
-            return Double.NaN;
-        }
-
-        referenceUp = vec3Normalize(referenceUp);
-        float[] referenceRight = vec3Normalize(vec3Cross(normalWorld, referenceUp));
-        if (vec3Len(referenceRight) < 1e-4f) {
-            return Double.NaN;
-        }
-
-        double cosAngle = vec3Dot(upWorld, referenceUp);
-        double sinAngle = vec3Dot(upWorld, referenceRight);
-        return normalizeDegrees(Math.toDegrees(Math.atan2(sinAngle, cosAngle)));
-    }
-
-    private QRMeasurement computeFloorYawWithSolvePnP(
-            float[] imagePoints,
-            CameraIntrinsics intrinsics,
-            float[] camPose,
-            float[] fopAttitude) {
-        Mat cameraMatrix = null;
-        MatOfDouble distCoeffs = null;
-        MatOfPoint3f objectPoints = null;
-        MatOfPoint2f imagePts = null;
-        Mat pnpAux1 = null;
-        Mat pnpAux2 = null;
-        Mat pnpAux3 = null;
-        List<Mat> rvecs = new ArrayList<>();
-        List<Mat> tvecs = new ArrayList<>();
-        try {
-            float[] focal = intrinsics.getFocalLength();
-            float[] pp = intrinsics.getPrincipalPoint();
-
-            double fx = focal[0];
-            double fy = focal[1];
-            double cx = pp[0];
-            double cy = pp[1];
-
-            cameraMatrix = new Mat(3, 3, CvType.CV_64F);
-            cameraMatrix.put(0, 0,
-                    fx, 0, cx,
-                    0, fy, cy,
-                    0, 0, 1);
-
-            distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
-
-            double half = (float) 0.1 / 2.0;
-
-            // IPPE_SQUARE expects points in this exact square coordinate order:
-            // top-left, top-right, bottom-right, bottom-left in object space.
-            objectPoints = new MatOfPoint3f(
-                    new Point3(-half,  half, 0),
-                    new Point3( half,  half, 0),
-                    new Point3( half, -half, 0),
-                    new Point3(-half, -half, 0)
-            );
-
-            imagePts = new MatOfPoint2f(
-                    new Point(imagePoints[0], imagePoints[1]),
-                    new Point(imagePoints[2], imagePoints[3]),
-                    new Point(imagePoints[4], imagePoints[5]),
-                    new Point(imagePoints[6], imagePoints[7])
-            );
-
-            pnpAux1 = new Mat();
-            pnpAux2 = new Mat();
-            pnpAux3 = new Mat();
-
-            int numSolutions = Calib3d.solvePnPGeneric(
-                    objectPoints, imagePts, cameraMatrix, distCoeffs,
-                    rvecs, tvecs, false, Calib3d.SOLVEPNP_IPPE_SQUARE,
-                    pnpAux1, pnpAux2, pnpAux3
-            );
-
-            if (numSolutions == 0) {
-                log("[solvePnP] Failed — no solutions");
-                return null;
-            }
-
-            // === DETERMINE WHICH PATH TO USE ===
-            boolean useDirect = (fopAttitude != null);
-
-            double bestScore = Double.MAX_VALUE;
-            double bestYaw = 0, bestPitch = 0, bestRoll = 0;
-            double bestReprojectionError = Double.NaN;
-            int bestSolutionIdx = -1;
-
-            for (int solIdx = 0; solIdx < numSolutions; solIdx++) {
-                Mat rotationMatrix = new Mat();
-                try {
-                    Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix);
-
-                    // QR normal (Z column) in OpenCV camera space
-                    double normalCamX = rotationMatrix.get(0, 2)[0];
-                    double normalCamY = rotationMatrix.get(1, 2)[0];
-                    double normalCamZ = rotationMatrix.get(2, 2)[0];
-
-                    // QR "up" (+Y column) in OpenCV camera space.
-                    double upCamX = rotationMatrix.get(0, 1)[0];
-                    double upCamY = rotationMatrix.get(1, 1)[0];
-                    double upCamZ = rotationMatrix.get(2, 1)[0];
-
-                    // === VECTOR 1: ARCORE SENSOR FRAME ===
-                    // Used strictly for ARCore to disambiguate the solvePnP pose
-                    float[] upCamAndroid = new float[]{
-                            (float) upCamX,
-                            (float) -upCamY,
-                            (float) -upCamZ
-                    };
-                    float[] normalCamAndroid = new float[]{
-                            (float) normalCamX,
-                            (float) -normalCamY,
-                            (float) -normalCamZ
-                    };
-
-                    // Transform to world space using ARCore pose (for disambiguation)
-                    float[] uWorld = rotateCamToWorld(upCamAndroid, camPose);
-                    float[] nWorld = rotateCamToWorld(normalCamAndroid, camPose);
-
-                    // Force normal to point UP away from floor.
-                    boolean flippedForFloor = nWorld[1] < 0;
-                    if (flippedForFloor) {
-                        uWorld = vec3Scale(uWorld, -1f);
-                        nWorld = vec3Scale(nWorld, -1f);
-                    }
-
-                    double solPitch = Math.toDegrees(Math.asin(
-                            Math.max(-1.0, Math.min(1.0, nWorld[1]))));
-
-                    // Select solution where "Up" is closest to horizontal
-                    double score = Math.abs(uWorld[1]);
-                    double reprojError = computeReprojectionRmse(
-                            objectPoints, imagePts, cameraMatrix, distCoeffs, rvecs.get(solIdx), tvecs.get(solIdx));
-
-                    double solYaw;
-
-                    if (useDirect) {
-                        // === VECTOR 2: DEVICE PORTRAIT FRAME ===
-                        // Used strictly for FOP absolute compass math
-                        float[] upCamDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ);
-
-                        float[] rotMatrix = new float[9];
-                        SensorManager.getRotationMatrixFromVector(rotMatrix, fopAttitude);
-
-                        float[] upCamFinal = upCamDevice;
-                        if (flippedForFloor) {
-                            upCamFinal = new float[]{-upCamDevice[0], -upCamDevice[1], -upCamDevice[2]};
-                        }
-
-                        // 1. Apply FOP rotation to get absolute earth bearing
-                        float upEast = rotMatrix[0] * upCamFinal[0] + rotMatrix[1] * upCamFinal[1] + rotMatrix[2] * upCamFinal[2];
-                        float upNorth = rotMatrix[3] * upCamFinal[0] + rotMatrix[4] * upCamFinal[1] + rotMatrix[5] * upCamFinal[2];
-
-                        // 2. Project onto horizontal plane via atan2 (ignores the Sky/Z vector to eliminate tilt bleed)
-                        solYaw = Math.toDegrees(Math.atan2(upEast, upNorth));
-                        if (solYaw < 0) solYaw += 360.0;
-
-                    } else {
-                        // === FALLBACK: ARCore world path ===
-                        solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(uWorld[0], uWorld[2])));
-                    }
-                    double solRoll = solYaw;
-
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestYaw = solYaw;
-                        bestPitch = solPitch;
-                        bestRoll = solRoll;
-                        bestReprojectionError = reprojError;
-                        bestSolutionIdx = solIdx;
-                    }
-
-                    Log.d(TAG, String.format(Locale.US,
-                            "[solvePnP] Solution %d: yaw=%.1f° pitch=%.1f° roll=%.1f° score=%.3f upWorld=(%.3f,%.3f,%.3f)",
-                            solIdx, solYaw, solPitch, solRoll, score, uWorld[0], uWorld[1], uWorld[2]));
-                } finally {
-                    rotationMatrix.release();
-                }
-            }
-
-            // Use different method name so processSample knows to skip offset
-            String method = useDirect ? "floor-solvepnp-direct" : "floor-solvepnp";
-            double confidence = useDirect
-                    ? confidenceFromReprojectionError(bestReprojectionError)
-                    : 1.0;
-            Log.d(TAG, String.format(Locale.US,
-                    "[solvePnP] Selected solution %d -> yaw=%.1f deg pitch=%.1f deg roll=%.1f deg reproj=%.4f conf=%.2f method=%s",
-                    bestSolutionIdx, bestYaw, bestPitch, bestRoll, bestReprojectionError, confidence, method));
-            return new QRMeasurement(bestYaw, bestPitch, bestRoll, confidence, method, useDirect);
-
-        } catch (Exception e) {
-            log("[solvePnP] Exception: " + e.getMessage());
-            return null;
-        } finally {
-            if (cameraMatrix != null) cameraMatrix.release();
-            if (distCoeffs != null) distCoeffs.release();
-            if (objectPoints != null) objectPoints.release();
-            if (imagePts != null) imagePts.release();
-            if (pnpAux1 != null) pnpAux1.release();
-            if (pnpAux2 != null) pnpAux2.release();
-            if (pnpAux3 != null) pnpAux3.release();
-            for (Mat r : rvecs) r.release();
-            for (Mat t : tvecs) t.release();
-        }
-    }
-
-    // Reprojection RMSE for a candidate PnP pose.
-    private double computeReprojectionRmse(MatOfPoint3f objectPoints,
-                                           MatOfPoint2f imagePoints,
-                                           Mat cameraMatrix,
-                                           MatOfDouble distCoeffs,
-                                           Mat rvec,
-                                           Mat tvec) {
-        MatOfPoint2f projectedPoints = new MatOfPoint2f();
-        try {
-            Calib3d.projectPoints(objectPoints, rvec, tvec, cameraMatrix, distCoeffs, projectedPoints);
-            Point[] projected = projectedPoints.toArray();
-            Point[] observed = imagePoints.toArray();
-            int count = Math.min(projected.length, observed.length);
-            if (count == 0) return Double.MAX_VALUE;
-
-            double sumSq = 0.0;
-            for (int i = 0; i < count; i++) {
-                double dx = projected[i].x - observed[i].x;
-                double dy = projected[i].y - observed[i].y;
-                sumSq += dx * dx + dy * dy;
-            }
-            return Math.sqrt(sumSq / count);
-        } finally {
-            projectedPoints.release();
-        }
-    }
-
-    private QRMeasurement computeWallYawWithSolvePnP(
-            float[] imagePoints,
-            CameraIntrinsics intrinsics,
-            float[] camPose,
-            float[] fopAttitude,
-            float[] vpNormalCam,
-            double vpWallRawYaw,
-            double vpWallNorthYaw) {
-        Mat cameraMatrix = null;
-        MatOfDouble distCoeffs = null;
-        MatOfPoint3f objectPoints = null;
-        MatOfPoint2f imagePts = null;
-        Mat pnpAux1 = null;
-        Mat pnpAux2 = null;
-        Mat pnpAux3 = null;
-        List<Mat> rvecs = new ArrayList<>();
-        List<Mat> tvecs = new ArrayList<>();
-        try {
-            float[] focal = intrinsics.getFocalLength();
-            float[] pp = intrinsics.getPrincipalPoint();
-
-            double fx = focal[0];
-            double fy = focal[1];
-            double cx = pp[0];
-            double cy = pp[1];
-
-            cameraMatrix = new Mat(3, 3, CvType.CV_64F);
-            cameraMatrix.put(0, 0,
-                    fx, 0, cx,
-                    0, fy, cy,
-                    0, 0, 1);
-
-            distCoeffs = new MatOfDouble(0, 0, 0, 0, 0);
-            double half = (float) 0.1 / 2.0;
-            objectPoints = new MatOfPoint3f(
-                    new Point3(-half, half, 0),
-                    new Point3(half, half, 0),
-                    new Point3(half, -half, 0),
-                    new Point3(-half, -half, 0)
-            );
-
-            imagePts = new MatOfPoint2f(
-                    new Point(imagePoints[0], imagePoints[1]),
-                    new Point(imagePoints[2], imagePoints[3]),
-                    new Point(imagePoints[4], imagePoints[5]),
-                    new Point(imagePoints[6], imagePoints[7])
-            );
-
-            pnpAux1 = new Mat();
-            pnpAux2 = new Mat();
-            pnpAux3 = new Mat();
-
-            int numSolutions = Calib3d.solvePnPGeneric(
-                    objectPoints, imagePts, cameraMatrix, distCoeffs,
-                    rvecs, tvecs, false, Calib3d.SOLVEPNP_IPPE_SQUARE,
-                    pnpAux1, pnpAux2, pnpAux3
-            );
-
-            if (numSolutions == 0) {
-                log("[wall-solvePnP] Failed - no solutions");
-                return null;
-            }
-
-            boolean useDirect = (fopAttitude != null);
-            float[] fopRotMatrix = new float[9];
-            if (useDirect) {
-                SensorManager.getRotationMatrixFromVector(fopRotMatrix, fopAttitude);
-            }
-            double continuityReferenceYaw = getWallContinuityReferenceYaw();
-
-            double bestScore = Double.MAX_VALUE;
-            double bestYaw = 0.0;
-            double bestPitch = 0.0;
-            double bestRoll = 0.0;
-            double bestReprojectionError = Double.NaN;
-            int bestSolutionIdx = -1;
-            double bestNormalCamX = 0.0;
-            double bestNormalCamY = 0.0;
-            double bestNormalCamZ = 0.0;
-            double secondBestScore = Double.MAX_VALUE;
-            double secondBestYaw = 0.0;
-            double secondBestPitch = 0.0;
-            double secondBestReprojectionError = Double.NaN;
-            int secondBestSolutionIdx = -1;
-
-            for (int solIdx = 0; solIdx < numSolutions; solIdx++) {
-                Mat rotationMatrix = new Mat();
-                try {
-                    Calib3d.Rodrigues(rvecs.get(solIdx), rotationMatrix);
-
-                    double normalCamX = rotationMatrix.get(0, 2)[0];
-                    double normalCamY = rotationMatrix.get(1, 2)[0];
-                    double normalCamZ = rotationMatrix.get(2, 2)[0];
-                    double upCamX = rotationMatrix.get(0, 1)[0];
-                    double upCamY = rotationMatrix.get(1, 1)[0];
-                    double upCamZ = rotationMatrix.get(2, 1)[0];
-
-                    // ── Step 1: Camera-space front-facing disambiguation ──
-                    // In OpenCV camera convention, Z points out of the camera.
-                    // A QR facing the camera has its normal pointing back toward
-                    // the camera, so normalCamZ must be negative.
-                    // This is purely geometric — no ARCore or FOP dependency.
-                    boolean frontFacing = normalCamZ < 0.0;
-                    if (!frontFacing) {
-                        normalCamX = -normalCamX;
-                        normalCamY = -normalCamY;
-                        normalCamZ = -normalCamZ;
-                        upCamX = -upCamX;
-                        upCamY = -upCamY;
-                        upCamZ = -upCamZ;
-                    }
-
-                    double solYaw;
-                    double solPitch;
-                    double solRoll;
-
-                    if (useDirect) {
-                        // ── Step 2: Map normal and up to device portrait frame ──
-                        float[] normalDevice = mapOpenCvCameraVectorToDeviceFrame(normalCamX, normalCamY, normalCamZ);
-                        float[] upDevice = mapOpenCvCameraVectorToDeviceFrame(upCamX, upCamY, upCamZ);
-
-                        // ── Step 3: Rotate normal to Earth frame via FOP ──
-                        // SensorManager rotation matrix rows:
-                        //   [0-2] = East,  [3-5] = North,  [6-8] = Up (gravity-opposite)
-                        float normalEast  = fopRotMatrix[0] * normalDevice[0] + fopRotMatrix[1] * normalDevice[1] + fopRotMatrix[2] * normalDevice[2];
-                        float normalNorth = fopRotMatrix[3] * normalDevice[0] + fopRotMatrix[4] * normalDevice[1] + fopRotMatrix[5] * normalDevice[2];
-                        float normalUp    = fopRotMatrix[6] * normalDevice[0] + fopRotMatrix[7] * normalDevice[1] + fopRotMatrix[8] * normalDevice[2];
-
-                        double horizLenEarth = Math.hypot(normalEast, normalNorth);
-                        if (horizLenEarth < 1e-5) {
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - horizontal normal too small",
-                                    solIdx));
-                            continue;
-                        }
-
-                        // ── Step 4: Yaw and pitch entirely from FOP-rotated normal ──
-                        solYaw = Math.toDegrees(Math.atan2(normalEast, normalNorth));
-                        if (solYaw < 0) solYaw += 360.0;
-
-                        solPitch = Math.toDegrees(Math.atan2(normalUp, horizLenEarth));
-
-                        // ── Step 5: Viewpoint-invariant roll ──
-                        //
-                        // Roll = rotation of the QR's top edge relative to gravity's
-                        // projection onto the wall plane. This is a physical property
-                        // of the QR on the wall and is independent of camera position.
-                        //
-                        // Strategy:
-                        //   1. Project gravity-up onto the wall plane → wallRefUp
-                        //      (the direction "up" means on this particular wall surface)
-                        //   2. Rotate PnP up-vector to Earth frame, then project
-                        //      onto the same wall plane → qrUpOnWall
-                        //   3. Measure the signed angle between them in-plane
-
-                        float[] normalEarthVec = new float[]{ normalEast, normalNorth, normalUp };
-
-                        // Gravity-up in the FOP Earth frame is (East=0, North=0, Up=1)
-                        float[] gravityUp = new float[]{ 0f, 0f, 1f };
-
-                        // Project gravity-up onto the wall plane:
-                        //   projected = gravityUp - (gravityUp · normal) * normal
-                        float dotGravNormal = vec3Dot(gravityUp, normalEarthVec);
-                        float[] wallRefUp = new float[]{
-                                gravityUp[0] - dotGravNormal * normalEarthVec[0],
-                                gravityUp[1] - dotGravNormal * normalEarthVec[1],
-                                gravityUp[2] - dotGravNormal * normalEarthVec[2]
-                        };
-
-                        if (vec3Len(wallRefUp) < 1e-4f) {
-                            // Wall normal is pointing straight up/down — this is a
-                            // ceiling or floor, not a wall. Roll is undefined.
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - wall normal too vertical for roll (FOP path)",
-                                    solIdx));
-                            continue;
-                        }
-                        wallRefUp = vec3Normalize(wallRefUp);
-
-                        // Rotate the PnP up-vector to Earth frame via FOP
-                        float upEast  = fopRotMatrix[0] * upDevice[0] + fopRotMatrix[1] * upDevice[1] + fopRotMatrix[2] * upDevice[2];
-                        float upNorth = fopRotMatrix[3] * upDevice[0] + fopRotMatrix[4] * upDevice[1] + fopRotMatrix[5] * upDevice[2];
-                        float upUp    = fopRotMatrix[6] * upDevice[0] + fopRotMatrix[7] * upDevice[1] + fopRotMatrix[8] * upDevice[2];
-                        float[] qrUpEarth = new float[]{ upEast, upNorth, upUp };
-
-                        // Project QR up onto the same wall plane
-                        float dotQrNormal = vec3Dot(qrUpEarth, normalEarthVec);
-                        float[] qrUpOnWall = new float[]{
-                                qrUpEarth[0] - dotQrNormal * normalEarthVec[0],
-                                qrUpEarth[1] - dotQrNormal * normalEarthVec[1],
-                                qrUpEarth[2] - dotQrNormal * normalEarthVec[2]
-                        };
-
-                        if (vec3Len(qrUpOnWall) < 1e-4f) {
-                            // QR up-vector is parallel to wall normal — degenerate
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - QR up degenerate on wall plane (FOP path)",
-                                    solIdx));
-                            continue;
-                        }
-                        qrUpOnWall = vec3Normalize(qrUpOnWall);
-
-                        // Build an in-plane right axis: wallRefRight = normal × wallRefUp
-                        // This gives us a signed 2D coordinate system on the wall face.
-                        float[] wallRefRight = vec3Normalize(vec3Cross(normalEarthVec, wallRefUp));
-                        if (vec3Len(wallRefRight) < 1e-4f) {
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - wall right vector degenerate (FOP path)",
-                                    solIdx));
-                            continue;
-                        }
-
-                        // Signed angle from wallRefUp to qrUpOnWall, measured in-plane
-                        double cosRoll = vec3Dot(qrUpOnWall, wallRefUp);
-                        double sinRoll = vec3Dot(qrUpOnWall, wallRefRight);
-                        solRoll = normalizeDegrees(Math.toDegrees(Math.atan2(sinRoll, cosRoll)));
-
-                    } else {
-                        // ── Legacy ARCore path (non-direct) ──
-                        // ARCore is acceptable here because this path does not claim
-                        // absolute north — it uses the mag anchor offset downstream.
-                        float[] normalCamAndroid = new float[]{
-                                (float) normalCamX,
-                                (float) -normalCamY,
-                                (float) -normalCamZ
-                        };
-                        float[] upCamAndroid = new float[]{
-                                (float) upCamX,
-                                (float) -upCamY,
-                                (float) -upCamZ
-                        };
-                        float[] normalWorld = rotateCamToWorld(normalCamAndroid, camPose);
-                        float[] upWorld = rotateCamToWorld(upCamAndroid, camPose);
-
-                        double horizLenWorld = Math.hypot(normalWorld[0], normalWorld[2]);
-                        if (horizLenWorld < 1e-5) {
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - horizontal world normal too small",
-                                    solIdx));
-                            continue;
-                        }
-
-                        solYaw = normalizeDegrees(Math.toDegrees(Math.atan2(normalWorld[0], normalWorld[2])));
-                        solPitch = Math.toDegrees(Math.asin(
-                                Math.max(-1.0, Math.min(1.0, normalWorld[1]))));
-                        solRoll = computeWallRollDegrees(upWorld, normalWorld);
-                        if (Double.isNaN(solRoll)) {
-                            log(String.format(Locale.US,
-                                    "[wall-solvePnP] Solution %d skipped - roll unavailable",
-                                    solIdx));
-                            continue;
-                        }
-                    }
-
-                    double reprojError = computeReprojectionRmse(
-                            objectPoints, imagePts, cameraMatrix, distCoeffs, rvecs.get(solIdx), tvecs.get(solIdx));
-                    if (reprojError > WALL_DIRECT_REPROJECTION_GATE_PX) {
-                        log(String.format(Locale.US,
-                                "[wall-solvePnP] Solution %d skipped - reproj %.4f px > %.2f px gate",
-                                solIdx, reprojError, WALL_DIRECT_REPROJECTION_GATE_PX));
-                        continue;
-                    }
-
-                    // Facing penalty: camera-space check already resolved the flip
-                    // above, so frontFacing should always be true after the flip.
-                    // We still penalize the originally-back-facing solution mildly
-                    // because the flipped pose is geometrically less trustworthy.
-                    double facingPenalty = frontFacing ? 0.0 : WALL_BACKFACING_PENALTY;
-                    double continuityPenalty = Double.isNaN(continuityReferenceYaw)
-                            ? 0.0
-                            : WALL_CONTINUITY_PENALTY_PER_DEG
-                            * Math.abs(angleDifference(continuityReferenceYaw, solYaw));
-                    double score = reprojError + facingPenalty + continuityPenalty;
-
-                    if (score < bestScore) {
-                        secondBestScore = bestScore;
-                        secondBestYaw = bestYaw;
-                        secondBestPitch = bestPitch;
-                        secondBestReprojectionError = bestReprojectionError;
-                        secondBestSolutionIdx = bestSolutionIdx;
-
-                        bestScore = score;
-                        bestYaw = solYaw;
-                        bestPitch = solPitch;
-                        bestRoll = solRoll;
-                        bestReprojectionError = reprojError;
-                        bestSolutionIdx = solIdx;
-                        bestNormalCamX = normalCamX;
-                        bestNormalCamY = normalCamY;
-                        bestNormalCamZ = normalCamZ;
-                    } else if (score < secondBestScore) {
-                        secondBestScore = score;
-                        secondBestYaw = solYaw;
-                        secondBestPitch = solPitch;
-                        secondBestReprojectionError = reprojError;
-                        secondBestSolutionIdx = solIdx;
-                    }
-
-                    log(String.format(Locale.US,
-                            "[wall-solvePnP] Solution %d: yaw=%.1f deg pitch=%.1f deg roll=%.1f deg reproj=%.4f facing=%b continuityPenalty=%.3f score=%.4f normalCam=(%.3f,%.3f,%.3f)",
-                            solIdx, solYaw, solPitch, solRoll, reprojError, frontFacing,
-                            continuityPenalty, score, normalCamX, normalCamY, normalCamZ));
-                } finally {
-                    rotationMatrix.release();
-                }
-            }
-
-            if (bestSolutionIdx < 0) {
-                log("[wall-solvePnP] No usable wall solutions");
-                return null;
-            }
-
-            if (secondBestSolutionIdx >= 0) {
-                double yawSplit = Math.abs(angleDifference(bestYaw, secondBestYaw));
-                double scoreMargin = secondBestScore - bestScore;
-                if (yawSplit >= WALL_AMBIGUITY_YAW_SPLIT_DEG
-                        && scoreMargin <= WALL_AMBIGUITY_MAX_SCORE_MARGIN) {
-                    log(String.format(Locale.US,
-                            "[wall-solvePnP] Ambiguous wall solutions: best=%d yaw=%.1f deg reproj=%.4f score=%.4f second=%d yaw=%.1f deg reproj=%.4f score=%.4f yawSplit=%.1f deg scoreMargin=%.4f -> suppressing sample",
-                            bestSolutionIdx, bestYaw, bestReprojectionError, bestScore,
-                            secondBestSolutionIdx, secondBestYaw, secondBestReprojectionError, secondBestScore,
-                            yawSplit, scoreMargin));
-                    return new QRMeasurement(bestYaw, bestPitch, bestRoll, 0.0, useDirect ? "wall-solvepnp-direct" : "wall-solvepnp", true);
-                }
-            }
-
-            double confidence = confidenceFromReprojectionError(bestReprojectionError);
-            log(String.format(Locale.US,
-                    "[wall-solvePnP] Selected solution %d -> yaw=%.1f deg pitch=%.1f deg roll=%.1f deg reproj=%.4f score=%.4f conf=%.2f",
-                    bestSolutionIdx, bestYaw, bestPitch, bestRoll, bestReprojectionError, bestScore, confidence));
-
-            double vpVsPnpNormalAxisDeltaDeg = Double.NaN;
-            if (vpNormalCam != null) {
-                double vpLen = Math.sqrt(
-                        vpNormalCam[0] * vpNormalCam[0]
-                                + vpNormalCam[1] * vpNormalCam[1]
-                                + vpNormalCam[2] * vpNormalCam[2]);
-                double pnpLen = Math.sqrt(
-                        bestNormalCamX * bestNormalCamX
-                                + bestNormalCamY * bestNormalCamY
-                                + bestNormalCamZ * bestNormalCamZ);
-                if (vpLen > 1e-6 && pnpLen > 1e-6) {
-                    double dot = (vpNormalCam[0] * bestNormalCamX
-                            + vpNormalCam[1] * bestNormalCamY
-                            + vpNormalCam[2] * bestNormalCamZ) / (vpLen * pnpLen);
-                    dot = Math.max(-1.0, Math.min(1.0, Math.abs(dot)));
-                    vpVsPnpNormalAxisDeltaDeg = Math.toDegrees(Math.acos(dot));
-                }
-            }
-            return new QRMeasurement(bestYaw, bestPitch, bestRoll, confidence, useDirect ? "wall-solvepnp-direct" : "wall-solvepnp", true);
-
-        } catch (Exception e) {
-            log("[wall-solvePnP] Exception: " + e.getMessage());
-            return null;
-        } finally {
-            if (cameraMatrix != null) cameraMatrix.release();
-            if (distCoeffs != null) distCoeffs.release();
-            if (objectPoints != null) objectPoints.release();
-            if (imagePts != null) imagePts.release();
-            if (pnpAux1 != null) pnpAux1.release();
-            if (pnpAux2 != null) pnpAux2.release();
-            if (pnpAux3 != null) pnpAux3.release();
-            for (Mat r : rvecs) r.release();
-            for (Mat t : tvecs) t.release();
-        }
-    }
 
     private double weightedMeanPitch(List<YawSample> samples) {
         double weightedSum = 0.0;
@@ -3044,7 +2708,8 @@ public class MainActivity extends AppCompatActivity {
             weightedSum += s.pitch * s.weight;
             totalWeight += s.weight;
         }
-        if (totalWeight < 1e-6) return 0.0;
+        if (totalWeight < 1e-6)
+            return 0.0;
         return weightedSum / totalWeight;
     }
 
@@ -3056,25 +2721,15 @@ public class MainActivity extends AppCompatActivity {
             sumCos += Math.cos(rad) * s.weight;
             totalWeight += s.weight;
         }
-        if (totalWeight < 1e-6) return 0.0;
+        if (totalWeight < 1e-6)
+            return 0.0;
         double mean = Math.toDegrees(Math.atan2(sumSin / totalWeight, sumCos / totalWeight));
-        if (mean < 0) mean += 360.0;
+        if (mean < 0)
+            mean += 360.0;
         return mean;
     }
 
-    private double circularWeightedMeanRaw(List<YawSample> samples) {
-        double sumSin = 0, sumCos = 0, totalWeight = 0;
-        for (YawSample s : samples) {
-            double rad = Math.toRadians(s.yaw);
-            sumSin += Math.sin(rad) * s.weight;
-            sumCos += Math.cos(rad) * s.weight;
-            totalWeight += s.weight;
-        }
-        if (totalWeight < 1e-6) return 0;
-        double mean = Math.toDegrees(Math.atan2(sumSin / totalWeight, sumCos / totalWeight));
-        if (mean < 0) mean += 360.0;
-        return mean;
-    }
+
 
     // Averages .northYaw (compass-referenced) — used for floor path
     private double circularWeightedMeanNorth(List<YawSample> samples) {
@@ -3085,9 +2740,11 @@ public class MainActivity extends AppCompatActivity {
             sumCos += Math.cos(rad) * s.weight;
             totalWeight += s.weight;
         }
-        if (totalWeight < 1e-6) return 0;
+        if (totalWeight < 1e-6)
+            return 0;
         double mean = Math.toDegrees(Math.atan2(sumSin / totalWeight, sumCos / totalWeight));
-        if (mean < 0) mean += 360.0;
+        if (mean < 0)
+            mean += 360.0;
         return mean;
     }
 }
